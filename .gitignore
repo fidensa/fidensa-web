@@ -1,0 +1,20 @@
+# Dependencies and package-manager cache
+/node_modules/
+/.npm-cache/
+
+# Next.js disposable build output
+/.next/
+/out/
+
+# Test and coverage output
+/coverage/
+/test-results/
+
+# Local environment overrides (the documented example remains governed)
+.env*
+!.env.example
+
+# Host/editor state
+.DS_Store
+*.tsbuildinfo
+

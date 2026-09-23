@@ -1,0 +1,68 @@
+{
+  "version": 2,
+  "routes": [
+    {
+      "path": "/",
+      "class": "public-html",
+      "status": 200,
+      "methods": ["GET", "HEAD"],
+      "representation": "html-nonce"
+    },
+    {
+      "path": "/apply",
+      "class": "public-html",
+      "status": 200,
+      "methods": ["GET", "HEAD"],
+      "representation": "html-nonce"
+    },
+    {
+      "path": "/privacy",
+      "class": "public-html",
+      "status": 200,
+      "methods": ["GET", "HEAD"],
+      "representation": "html-nonce"
+    },
+    {
+      "path": "/evidence",
+      "class": "public-html",
+      "status": 200,
+      "methods": ["GET", "HEAD"],
+      "representation": "html-nonce"
+    },
+    {
+      "path": "/__foundation_missing_route__",
+      "class": "public-error",
+      "status": 404,
+      "methods": ["GET", "HEAD"],
+      "representation": "html-nonce"
+    },
+    {
+      "path": "/favicon.ico",
+      "class": "framework-error",
+      "status": 404,
+      "methods": ["GET", "HEAD"],
+      "representation": "html-nonce"
+    },
+    {
+      "path": "/_next/static/does-not-exist.js",
+      "class": "framework-error",
+      "status": 404,
+      "methods": ["GET", "HEAD"],
+      "representation": "non-html"
+    },
+    {
+      "path": "/_next/image",
+      "class": "framework-error",
+      "status": 400,
+      "methods": ["GET", "HEAD"],
+      "representation": "non-html"
+    },
+    {
+      "path": "$FIRST_FINGERPRINTED_STATIC_ASSET",
+      "class": "fingerprinted-asset",
+      "status": 200,
+      "methods": ["GET", "HEAD"],
+      "representation": "non-html"
+    }
+  ]
+}
