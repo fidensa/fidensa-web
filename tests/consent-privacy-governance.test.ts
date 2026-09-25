@@ -21,6 +21,7 @@ import {
   createResendMarketingContactProvider,
   reconcileOneGlobalSuppression,
   reconcileOneSubscription,
+  removeExerciseMarketingContact,
 } from "../src/server/resend-contact-sync";
 import { deliverOnePrivacyConfirmation } from "../src/server/privacy-confirmation-delivery";
 
@@ -166,6 +167,105 @@ describe("provider synchronization", () => {
     reconcileFirst: true,
     firstActivationConfirmed: false,
   };
+
+  it("removes the controlled contact and its topic state through a deterministic provider double", async () => {
+    let exists = true;
+    let topicSubscribed = true;
+    const remove = vi.fn(async () => {
+      exists = false;
+      topicSubscribed = false;
+    });
+    await removeExerciseMarketingContact(
+      {
+        remove,
+        async read() {
+          return {
+            exists,
+            contactSubscribed: exists,
+            topicSubscribed,
+            globallyRestricted: false,
+          };
+        },
+      },
+      "exercise@synthetic.invalid",
+    );
+    expect(remove).toHaveBeenCalledWith("exercise@synthetic.invalid");
+  });
+
+  it.each([
+    [
+      "contact",
+      {
+        exists: true,
+        contactSubscribed: false,
+        topicSubscribed: false,
+        globallyRestricted: false,
+      },
+    ],
+    [
+      "topic",
+      {
+        exists: false,
+        contactSubscribed: false,
+        topicSubscribed: true,
+        globallyRestricted: false,
+      },
+    ],
+  ])(
+    "fails cleanup when provider %s read-back persists",
+    async (_label, snapshot) => {
+      await expect(
+        removeExerciseMarketingContact(
+          {
+            remove: vi.fn(async () => undefined),
+            read: vi.fn(async () => snapshot),
+          },
+          "exercise@synthetic.invalid",
+        ),
+      ).rejects.toThrow(
+        "Provider contact cleanup did not remove contact/topic state.",
+      );
+    },
+  );
+
+  it("uses Resend contact deletion and verifies absence by read-back", async () => {
+    const requests: string[] = [];
+    let exists = true;
+    const provider = createResendMarketingContactProvider({
+      accessCredential: "r".repeat(40),
+      marketingTopicId: "topic_marketing",
+      fetchImplementation: vi.fn(async (input, init) => {
+        const url = new URL(input.toString());
+        const method = init?.method ?? "GET";
+        requests.push(`${method} ${url.pathname}`);
+        if (method === "DELETE" && url.pathname.includes("/contacts/")) {
+          exists = false;
+          return new Response(null, { status: 204 });
+        }
+        if (url.pathname.includes("/contacts/") && method === "GET") {
+          return exists
+            ? Response.json({
+                object: "contact",
+                email: "exercise@synthetic.invalid",
+                unsubscribed: false,
+              })
+            : new Response(null, { status: 404 });
+        }
+        if (url.pathname.includes("/suppressions/")) {
+          return new Response(null, { status: 404 });
+        }
+        throw new Error(`Unexpected provider request: ${method} ${url}`);
+      }) as typeof fetch,
+    });
+    await removeExerciseMarketingContact(
+      provider,
+      "exercise@synthetic.invalid",
+    );
+    expect(requests).toContain("DELETE /contacts/exercise%40synthetic.invalid");
+    expect(requests).not.toContain(
+      "GET /contacts/exercise%40synthetic.invalid/topics",
+    );
+  });
 
   it("reconciles read-back before retrying a partial create", async () => {
     const apply = vi.fn();

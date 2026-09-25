@@ -101,12 +101,14 @@ async function createActivation(db: PGlite): Promise<void> {
     "privacy-v1",
     true,
     "updates-v1",
+    null,
+    null,
   ];
   const placeholders = parameters.map((_, index) => `$${index + 1}`).join(",");
   await withRole(db, "service_role", () =>
     scalar(
       db,
-      `select fidensa_api.submit_application(${placeholders})`,
+      `select fidensa_api.submit_application_intake(${placeholders})`,
       parameters,
     ),
   );

@@ -121,6 +121,7 @@ const approvedMigrationFiles = new Set([
   "migrations/20260925101000_consent_suppression_privacy_operations.sql",
   "migrations/20260925101500_global_suppression_delivery_guard.sql",
   "migrations/20260925102000_first_activation_reconciliation_guard.sql",
+  "migrations/20260925103000_controlled_exercise_acceptance_guards.sql",
   "migrations/recovery/20260924223000_drop_protected_application_database.sql",
 ]);
 if (

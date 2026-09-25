@@ -37,6 +37,8 @@ function submission(): ApplicationSubmissionRecord {
     noticeVersion: "privacy-v1",
     marketingSelected: false,
     consentTextVersion: null,
+    exerciseCorrelationId: null,
+    exerciseRecipient: null,
   };
 }
 

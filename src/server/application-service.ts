@@ -39,6 +39,11 @@ interface ApplicationServiceOptions {
   readonly siteOrigin: string;
   readonly reviewerRecordBaseUrl: string;
   readonly synthetic: boolean;
+  readonly exerciseAuthority?: Readonly<{
+    correlationId: string;
+    exactRecipient: string;
+  }>;
+  readonly log?: () => void;
   readonly defer: (task: () => Promise<void>) => void;
 }
 
@@ -56,6 +61,14 @@ function json(status: number, body: unknown): Response {
 
 function generic(message: string): Response {
   return json(200, { message });
+}
+
+function genericLogged(
+  options: ApplicationServiceOptions,
+  message: string,
+): Response {
+  options.log?.();
+  return generic(message);
 }
 
 function recordFor(
@@ -93,6 +106,8 @@ function recordFor(
     consentTextVersion: input.marketingSelected
       ? MARKETING_CONSENT_VERSION
       : null,
+    exerciseCorrelationId: options.exerciseAuthority?.correlationId ?? null,
+    exerciseRecipient: options.exerciseAuthority?.exactRecipient ?? null,
   };
 }
 
@@ -229,7 +244,7 @@ export function createApplicationService(options: ApplicationServiceOptions) {
         defer(options, () =>
           options.database.recordHoneypot(ipDigest, emailDigest),
         );
-        return generic(GENERIC_APPLICATION_RESPONSE);
+        return genericLogged(options, GENERIC_APPLICATION_RESPONSE);
       }
 
       const credential = issueVerificationCredential();
@@ -247,7 +262,7 @@ export function createApplicationService(options: ApplicationServiceOptions) {
         if (intent)
           await deliverTransientVerification(options, intent, credential);
       });
-      return generic(GENERIC_APPLICATION_RESPONSE);
+      return genericLogged(options, GENERIC_APPLICATION_RESPONSE);
     },
 
     async verify(request: Request): Promise<Response> {
@@ -255,10 +270,11 @@ export function createApplicationService(options: ApplicationServiceOptions) {
       try {
         raw = await readBoundedJson(request, APPLICATION_LIMITS.requestBytes);
       } catch {
-        return generic(GENERIC_VERIFICATION_RESPONSE);
+        return genericLogged(options, GENERIC_VERIFICATION_RESPONSE);
       }
       const parsed = parseVerificationRequest(raw);
-      if (!parsed.ok) return generic(GENERIC_VERIFICATION_RESPONSE);
+      if (!parsed.ok)
+        return genericLogged(options, GENERIC_VERIFICATION_RESPONSE);
       const ipDigest = digestIpIdentity(
         options.tokenMaterial,
         requestIpIdentity(request),
@@ -279,7 +295,7 @@ export function createApplicationService(options: ApplicationServiceOptions) {
           ]);
         }
       });
-      return generic(GENERIC_VERIFICATION_RESPONSE);
+      return genericLogged(options, GENERIC_VERIFICATION_RESPONSE);
     },
 
     async resend(request: Request): Promise<Response> {
@@ -311,7 +327,7 @@ export function createApplicationService(options: ApplicationServiceOptions) {
         if (intent)
           await deliverTransientVerification(options, intent, credential);
       });
-      return generic(GENERIC_APPLICATION_RESPONSE);
+      return genericLogged(options, GENERIC_APPLICATION_RESPONSE);
     },
 
     async reconcile(): Promise<number> {

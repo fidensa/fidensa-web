@@ -117,6 +117,15 @@ be imported as a recipient restriction. The migration repeats the narrow
 function revoke/grant boundary and is exercised both as an upgrade over the
 prior chain and in clean rebuilds.
 
+The controlled-exercise acceptance migration binds staged submission and
+verification wrappers to one open, unexpired exercise correlation and exact
+recipient, carries that correlation into terminal and job-run guards, and
+extends cleanup across application, consent, privacy, provider-state, and
+operational residue while preserving only the acceptance record. Recovery is
+forward-only: halt a remote apply before execution when possible; otherwise add
+a reviewed follow-up migration that restores the prior wrapper signatures and
+guard behavior without editing an applied migration.
+
 Resend's primary Webhooks verification, Event Types, Contacts, and Topics
 documentation and the provider OpenAPI 1.5.0 contract were rechecked on
 2026-09-25. Verification uses the untouched raw body with `svix-id`,

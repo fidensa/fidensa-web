@@ -17,6 +17,8 @@ const firstActivationGuardMigration =
   "20260925102000_first_activation_reconciliation_guard.sql";
 const globalSuppressionDeliveryGuardMigration =
   "20260925101500_global_suppression_delivery_guard.sql";
+const controlledExerciseAcceptanceMigration =
+  "20260925103000_controlled_exercise_acceptance_guards.sql";
 
 function invariant(condition, message) {
   if (!condition) throw new Error(message);
@@ -50,6 +52,36 @@ async function expectRejectedTransaction(db, action, label) {
   await db.exec("reset role");
   await db.exec("set session authorization postgres");
   throw new Error(`Expected rejection: ${label}`);
+}
+
+async function withRollback(db, action) {
+  await db.exec("begin");
+  try {
+    await action();
+  } finally {
+    await db.exec("rollback");
+    await db.exec("reset role");
+    await db.exec("set session authorization postgres");
+  }
+}
+
+async function applicationEffectSnapshot(db) {
+  const tables = [
+    "applications",
+    "verifications",
+    "subscriptions",
+    "communications",
+    "application_message_outbox",
+    "reviewer_status",
+    "provider_events",
+  ];
+  const snapshot = {};
+  for (const table of tables) {
+    snapshot[table] = Number(
+      await scalar(db, `select count(*) from fidensa_private.${table}`),
+    );
+  }
+  return snapshot;
 }
 
 async function scalar(db, sql, params = []) {
@@ -340,12 +372,10 @@ async function submit(
     marketing ? "updates-v1" : null,
   ];
   const placeholders = parameters.map((_, index) => `$${index + 1}`).join(",");
-  return withRole(db, "service_role", () =>
-    scalar(
-      db,
-      `select fidensa_api.submit_application(${placeholders}) as application_id`,
-      parameters,
-    ),
+  return scalar(
+    db,
+    `select fidensa_api.submit_application(${placeholders}) as application_id`,
+    parameters,
   );
 }
 
@@ -353,6 +383,65 @@ async function verify(db, label, now = "2039-01-01T00:01:00Z") {
   await configureTestAuthority(db, now);
   return withRole(db, "service_role", () =>
     scalar(db, "select fidensa_api.verify_application($1,$2) as verified", [
+      digest(`${label}:verification`),
+      digest(`${label}:verify-ip`),
+    ]),
+  );
+}
+
+async function submitControlledIntake(
+  db,
+  {
+    label,
+    correlation,
+    expectedRecipient = "exercise@synthetic.invalid",
+    email = "exercise@synthetic.invalid",
+    now,
+    marketing = false,
+  },
+) {
+  await configureTestAuthority(db, now, "Staged-production");
+  const parameters = [
+    true,
+    email,
+    email,
+    digest(`${label}:operation`),
+    digest(`${label}:verification`),
+    digest(`${label}:ip`),
+    digest(`${label}:email`),
+    "Synthetic Applicant",
+    "Synthetic Role",
+    "Work",
+    "Synthetic Organization",
+    "[synthetic fixture]",
+    "[synthetic fixture]",
+    "Not sure yet",
+    "No fixed timeline",
+    "Maybe",
+    null,
+    null,
+    null,
+    "privacy-v1",
+    marketing,
+    marketing ? "updates-v1" : null,
+    correlation,
+    expectedRecipient,
+  ];
+  const placeholders = parameters.map((_, index) => `$${index + 1}`).join(",");
+  const intent = await withRole(db, "service_role", () =>
+    scalar(
+      db,
+      `select fidensa_api.submit_application_intake(${placeholders})`,
+      parameters,
+    ),
+  );
+  return intent?.applicationId ?? null;
+}
+
+async function verifyControlledIntake(db, label, now) {
+  await configureTestAuthority(db, now, "Staged-production");
+  return withRole(db, "service_role", () =>
+    scalar(db, "select fidensa_api.verify_application_intake($1,$2)", [
       digest(`${label}:verification`),
       digest(`${label}:verify-ip`),
     ]),
@@ -620,8 +709,19 @@ async function testCatalogAndAccess(db) {
         `select count(*) from pg_proc p join pg_namespace n on n.oid=p.pronamespace
          where n.nspname='fidensa_api' and has_function_privilege('service_role',p.oid,'execute')`,
       ),
-    ) === 24,
-    "server secret role must receive only the twenty-four bounded server operations",
+    ) === 23,
+    "server secret role must receive only the twenty-three bounded server operations",
+  );
+  invariant(
+    !(await scalar(
+      db,
+      `select has_function_privilege(
+        'service_role',
+        'fidensa_api.submit_application(boolean,text,text,text,text,text,text,text,text,text,text,text,text,text,text,text,text,text,text,text,boolean,text)',
+        'execute'
+      )`,
+    )),
+    "server role must not bypass the correlation-bound intake wrapper",
   );
   for (const operation of ["run_current_retention", "run_retention_health"]) {
     await withRole(db, "service_role", () =>
@@ -689,6 +789,8 @@ async function testApplicationDeliveryIntents(db) {
     "privacy-v1",
     true,
     "updates-v1",
+    null,
+    null,
   ];
   const placeholders = parameters.map((_, index) => `$${index + 1}`).join(",");
   const submissionIntent = await withRole(db, "service_role", () =>
@@ -2361,10 +2463,284 @@ async function testApplicationQueueAndScoring(db) {
   console.log("PASS application, queue, scoring, and communication invariants");
 }
 
+async function createExerciseGate(
+  db,
+  correlation,
+  {
+    recipient = "exercise@synthetic.invalid",
+    opensAt = new Date(Date.now() - 60_000).toISOString(),
+    expiresAt = new Date(Date.now() + 86_400_000).toISOString(),
+  } = {},
+) {
+  return scalar(
+    db,
+    `select fidensa_api.create_exercise_control(
+      $1,$2,$3,$4,$5,$6,$7,$8,$9,$10
+    )`,
+    [
+      correlation,
+      digest(`checklist:${correlation}`),
+      `deployment:${correlation}`,
+      digest(`config:${correlation}`),
+      "1".repeat(40),
+      recipient,
+      opensAt,
+      expiresAt,
+      digest(`members:${correlation}`),
+      "2041-01-01T00:00:00Z",
+    ],
+  );
+}
+
+async function openExerciseGate(db, exerciseId, now = "2041-01-01T00:00:00Z") {
+  await configureTestAuthority(db, now, "Staged-production");
+  await db.query(
+    "select fidensa_api.transition_exercise_control($1,1,'intake_open',null,null,null,$2)",
+    [exerciseId, now],
+  );
+}
+
+async function testExerciseGateRejections(db) {
+  const baseCorrelation = "00000000-0000-4000-8000-000000000210";
+  const current = () => new Date().toISOString();
+
+  await withRollback(db, async () => {
+    await configureTestAuthority(db, current(), "Staged-production");
+    const before = await applicationEffectSnapshot(db);
+    invariant(
+      !(await submitControlledIntake(db, {
+        label: "gate-absent",
+        correlation: baseCorrelation,
+        now: current(),
+      })),
+      "absent exercise gate must reject submission",
+    );
+    invariant(
+      JSON.stringify(await applicationEffectSnapshot(db)) ===
+        JSON.stringify(before),
+      "absent gate rejection must have zero application/provider/reviewer effects",
+    );
+  });
+
+  await withRollback(db, async () => {
+    await createExerciseGate(db, baseCorrelation);
+    await configureTestAuthority(db, current(), "Staged-production");
+    const before = await applicationEffectSnapshot(db);
+    invariant(
+      !(await submitControlledIntake(db, {
+        label: "gate-closed",
+        correlation: baseCorrelation,
+        now: current(),
+      })),
+      "intake_closed exercise gate must reject submission",
+    );
+    invariant(
+      JSON.stringify(await applicationEffectSnapshot(db)) ===
+        JSON.stringify(before),
+      "closed gate rejection must have zero application/provider/reviewer effects",
+    );
+  });
+
+  await withRollback(db, async () => {
+    const exerciseId = await createExerciseGate(db, baseCorrelation, {
+      opensAt: "2019-12-31T23:00:00Z",
+      expiresAt: "2020-01-02T00:00:00Z",
+    });
+    await configureTestAuthority(db, "2020-01-01T00:00:00Z");
+    await db.query(
+      "select fidensa_api.transition_exercise_control($1,1,'intake_open',null,null,null,$2)",
+      [exerciseId, "2020-01-01T00:00:00Z"],
+    );
+    await configureTestAuthority(db, current(), "Staged-production");
+    const before = await applicationEffectSnapshot(db);
+    invariant(
+      !(await submitControlledIntake(db, {
+        label: "gate-expired",
+        correlation: baseCorrelation,
+        now: current(),
+      })),
+      "expired exercise gate must reject submission",
+    );
+    invariant(
+      JSON.stringify(await applicationEffectSnapshot(db)) ===
+        JSON.stringify(before),
+      "expired gate rejection must have zero application/provider/reviewer effects",
+    );
+  });
+
+  for (const [label, correlation, recipient] of [
+    [
+      "correlation-mismatch",
+      "00000000-0000-4000-8000-000000000211",
+      "exercise@synthetic.invalid",
+    ],
+    ["recipient-mismatch", baseCorrelation, "other@synthetic.invalid"],
+  ]) {
+    await withRollback(db, async () => {
+      const exerciseId = await createExerciseGate(db, baseCorrelation);
+      await openExerciseGate(db, exerciseId);
+      const before = await applicationEffectSnapshot(db);
+      invariant(
+        !(await submitControlledIntake(db, {
+          label: `gate-${label}`,
+          correlation,
+          expectedRecipient: recipient,
+          now: current(),
+        })),
+        `${label} exercise gate must reject submission`,
+      );
+      invariant(
+        JSON.stringify(await applicationEffectSnapshot(db)) ===
+          JSON.stringify(before),
+        `${label} rejection must have zero application/provider/reviewer effects`,
+      );
+    });
+  }
+
+  await withRollback(db, async () => {
+    await createExerciseGate(db, baseCorrelation);
+    await expectRejected(
+      () => createExerciseGate(db, "00000000-0000-4000-8000-000000000212"),
+      "ambiguous duplicated exercise gate",
+    );
+  });
+
+  for (const state of ["absent", "uncommitted", "mismatched", "invalidated"]) {
+    await withRollback(db, async () => {
+      const fixtureLabel = `verification-${state}`;
+      let exerciseId;
+      let applicationId;
+      if (state === "absent") {
+        applicationId = await submit(db, {
+          label: fixtureLabel,
+          now: current(),
+        });
+        await configureTestAuthority(db, current(), "Staged-production");
+      } else if (state === "uncommitted") {
+        applicationId = await submit(db, {
+          label: fixtureLabel,
+          now: current(),
+        });
+        exerciseId = await createExerciseGate(db, baseCorrelation);
+        await openExerciseGate(db, exerciseId);
+      } else if (state === "mismatched") {
+        applicationId = await submit(db, {
+          label: fixtureLabel,
+          now: current(),
+        });
+        exerciseId = await createExerciseGate(db, baseCorrelation);
+        await openExerciseGate(db, exerciseId);
+        await submitControlledIntake(db, {
+          label: `${fixtureLabel}-committed-other`,
+          correlation: baseCorrelation,
+          now: current(),
+        });
+      } else {
+        exerciseId = await createExerciseGate(db, baseCorrelation);
+        await openExerciseGate(db, exerciseId);
+        applicationId = await submitControlledIntake(db, {
+          label: fixtureLabel,
+          correlation: baseCorrelation,
+          now: current(),
+        });
+        await db.query(
+          "select fidensa_api.transition_exercise_control($1,3,'invalidated',null,null,'synthetic mismatch',$2)",
+          [exerciseId, current()],
+        );
+      }
+      invariant(applicationId, `${state} verification fixture must exist`);
+      const before = await applicationEffectSnapshot(db);
+      invariant(
+        !(await verifyControlledIntake(db, fixtureLabel, current())),
+        `${state} exercise correlation must reject verification`,
+      );
+      invariant(
+        JSON.stringify(await applicationEffectSnapshot(db)) ===
+          JSON.stringify(before),
+        `${state} verification rejection must have zero new effects`,
+      );
+    });
+  }
+
+  for (const state of ["executed", "review_pending"]) {
+    await withRollback(db, async () => {
+      const correlation =
+        state === "executed"
+          ? "00000000-0000-4000-8000-000000000213"
+          : "00000000-0000-4000-8000-000000000214";
+      const label = `verification-${state}`;
+      const exerciseId = await createExerciseGate(db, correlation);
+      await openExerciseGate(db, exerciseId);
+      await submitControlledIntake(db, {
+        label,
+        correlation,
+        now: current(),
+      });
+      if (state === "review_pending") {
+        await db.query(
+          "select fidensa_api.transition_exercise_control($1,3,'review_pending',null,null,null,$2)",
+          [exerciseId, current()],
+        );
+      }
+      invariant(
+        await verifyControlledIntake(db, label, current()),
+        `${state} committed correlation must accept verification after intake closes`,
+      );
+    });
+  }
+  console.log(
+    "PASS staged submission and verification gate rejection/zero-effect matrices",
+  );
+}
+
+async function untaggedExerciseWindowResidue(db, opensAt, expiresAt) {
+  const inventory = await db.query(
+    `select correlation.table_name,
+            array_agg(temporal.column_name order by temporal.ordinal_position)
+              filter (where temporal.data_type like 'timestamp%') as temporal_columns
+       from information_schema.columns correlation
+       join information_schema.columns temporal
+         on temporal.table_schema=correlation.table_schema
+        and temporal.table_name=correlation.table_name
+      where correlation.table_schema='fidensa_private'
+        and correlation.column_name='correlation_id'
+      group by correlation.table_name
+      order by correlation.table_name`,
+  );
+  const residue = [];
+  for (const row of inventory.rows) {
+    const table = row.table_name;
+    const temporalColumns = row.temporal_columns ?? [];
+    invariant(
+      /^[a-z][a-z0-9_]*$/.test(table) && temporalColumns.length > 0,
+      `correlation-bearing table ${table} must expose a temporal anchor`,
+    );
+    const windowPredicate = temporalColumns
+      .map((column) => {
+        invariant(
+          /^[a-z][a-z0-9_]*$/.test(column),
+          `temporal anchor ${column} must be a safe identifier`,
+        );
+        return `("${column}" >= $1 and "${column}" <= $2)`;
+      })
+      .join(" or ");
+    const count = Number(
+      await scalar(
+        db,
+        `select count(*) from fidensa_private."${table}"
+          where correlation_id is null and (${windowPredicate})`,
+        [opensAt, expiresAt],
+      ),
+    );
+    residue.push({ table, count });
+  }
+  return residue;
+}
+
 async function testExerciseControl(db) {
   const correlation = "00000000-0000-4000-8000-000000000201";
   const stagedClock = Date.now();
-  const stagedOpensAt = new Date(stagedClock - 60_000).toISOString();
+  const stagedOpensAt = new Date(stagedClock).toISOString();
   const stagedExpiresAt = new Date(stagedClock + 86_400_000).toISOString();
   const createParameters = [
     correlation,
@@ -2408,6 +2784,18 @@ async function testExerciseControl(db) {
     digest("fixture-verifier"),
     "2041-01-01T00:00:00Z",
   ]);
+  await configureTestAuthority(db, new Date(stagedClock).toISOString());
+  await db.query(
+    `insert into fidensa_private.job_runs (
+       job_type,version,scheduled_bucket,selection_cutoff,first_started_at,
+       first_terminal_at,outcome,expires_at,correlation_id
+     ) values (
+       'exercise_cleanup_fixture','v1','2039-01-01T00:00:00Z',
+       '2039-01-01T00:25:00Z','2039-01-01T00:00:00Z',
+       '2039-01-01T00:00:00Z','succeeded','2039-04-01T00:00:00Z',$1
+     )`,
+    [correlation],
+  );
   await configureTestAuthority(
     db,
     new Date(stagedClock).toISOString(),
@@ -2418,22 +2806,21 @@ async function testExerciseControl(db) {
     [exerciseId, "2041-01-01T00:00:00Z"],
   );
 
-  const stagedApplication = await submit(db, {
+  const stagedApplication = await submitControlledIntake(db, {
     label: "exercise",
-    email: "exercise@synthetic.invalid",
-    now: "2041-01-01T00:01:00Z",
-    environment: "Staged-production",
+    correlation,
+    now: new Date(stagedClock).toISOString(),
+    marketing: true,
   });
   invariant(
     stagedApplication,
     "exact allowlisted staged submission must commit",
   );
   invariant(
-    !(await submit(db, {
+    !(await submitControlledIntake(db, {
       label: "exercise-second",
-      email: "exercise@synthetic.invalid",
-      now: "2041-01-01T00:02:00Z",
-      environment: "Staged-production",
+      correlation,
+      now: new Date(stagedClock).toISOString(),
     })),
     "consumed exercise gate must deny a second submission",
   );
@@ -2445,6 +2832,124 @@ async function testExerciseControl(db) {
       ]),
     ),
     "issued verifier must authorize only the bounded exercise",
+  );
+  invariant(
+    await verifyControlledIntake(
+      db,
+      "exercise",
+      new Date(stagedClock).toISOString(),
+    ),
+    "executed committed exercise correlation must verify after intake closes",
+  );
+  const exerciseSubscription = await db.query(
+    "select id,version,canonical_email from fidensa_private.subscriptions where correlation_id=$1",
+    [correlation],
+  );
+  const subscriptionId = exerciseSubscription.rows[0]?.id;
+  invariant(
+    subscriptionId,
+    "marketing-enabled exercise subscription must exist",
+  );
+  const activeRubric = await scalar(
+    db,
+    "select id from fidensa_private.rubric_versions where active",
+  );
+  await db.exec("begin");
+  await db.query(
+    `insert into fidensa_private.application_score_cohorts
+       (application_id,rubric_version_id,first_scored_at)
+     values ($1,$2,fidensa_private.authoritative_now())`,
+    [stagedApplication, activeRubric],
+  );
+  const exerciseScoreSet = await scalar(
+    db,
+    `insert into fidensa_private.score_sets
+       (application_id,rubric_version_id,state,assessor,assessed_at)
+     values ($1,$2,'incomplete','scott_bishop',fidensa_private.authoritative_now())
+     returning id`,
+    [stagedApplication, activeRubric],
+  );
+  await db.query(
+    `insert into fidensa_private.scores
+       (score_set_id,criterion_id,value_kind,numeric_value,rationale,assessor,assessed_at)
+     select $1,id,'numeric',3,'Synthetic controlled-exercise rationale',
+            'scott_bishop',fidensa_private.authoritative_now()
+       from fidensa_private.rubric_criteria
+      where rubric_version_id=$2 and criterion_key='real_ai_security_need'`,
+    [exerciseScoreSet, activeRubric],
+  );
+  await db.exec("commit");
+  await db.query(
+    `insert into fidensa_private.provider_contact_state (
+       canonical_email,subscription_id,subscription_version,available,
+       contact_subscribed,marketing_topic_subscribed,globally_restricted,
+       observed_at,first_active_read_back_at
+     ) values ($1,$2,$3,true,true,true,false,
+       fidensa_private.authoritative_now(),fidensa_private.authoritative_now())`,
+    [
+      "exercise@synthetic.invalid",
+      subscriptionId,
+      exerciseSubscription.rows[0].version,
+    ],
+  );
+  await db.query(
+    `insert into fidensa_private.suppressions (
+       canonical_email,scope,state,reason,source_event,effective_at,
+       retention_purpose,review_or_disposal_at,correlation_id
+     ) values ($1,'marketing_topic','effective','synthetic cleanup fixture',
+       'controlled-exercise',fidensa_private.authoritative_now(),
+       'controlled exercise cleanup',fidensa_private.authoritative_now()+interval '24 months',$2)`,
+    ["exercise@synthetic.invalid", correlation],
+  );
+  await withRole(db, "service_role", () =>
+    db.query(
+      `select fidensa_api.record_provider_event(
+         $1,'contact.updated',$2,
+         'subscription',$3,'synthetic',$4,$5
+       )`,
+      [
+        digest("exercise-provider-event"),
+        new Date(stagedClock).toISOString(),
+        subscriptionId,
+        "exercise@synthetic.invalid",
+        correlation,
+      ],
+    ),
+  );
+  const privacyId = "00000000-0000-4000-8000-000000000219";
+  await db.exec("begin");
+  await db.query(
+    `insert into fidensa_private.privacy_requests (
+       id,request_type,canonical_email,delivery_email,route,operation_digest,
+       state,received_at,confirmation_intent_due_at,target_due_at,correlation_id
+     ) values ($1,'access',$2,$2,'privacy_public',$3,'awaiting_confirmation',
+       fidensa_private.authoritative_now(),
+       fidensa_private.authoritative_now()+interval '24 hours',
+       fidensa_private.authoritative_now()+interval '30 days',$4)`,
+    [
+      privacyId,
+      "exercise@synthetic.invalid",
+      digest("exercise-privacy-operation"),
+      correlation,
+    ],
+  );
+  await db.query(
+    `insert into fidensa_private.privacy_request_history (
+       privacy_request_id,prior_state,new_state,event_class,actor,reason,
+       occurred_at,transition_version
+     ) values ($1,null,'awaiting_confirmation','transition','requester',
+       'synthetic controlled exercise',fidensa_private.authoritative_now(),1)`,
+    [privacyId],
+  );
+  await db.exec("commit");
+  await db.query(
+    `insert into fidensa_private.operational_logs (
+       environment,event_class,operation_id,result_class,occurred_at,
+       deletion_deadline,correlation_id
+     ) values ('Staged-production','controlled_exercise',gen_random_uuid(),
+       'synthetic',fidensa_private.authoritative_now(),
+       fidensa_private.authoritative_now()+interval '30 days',$1)`,
+    [correlation],
   );
   await db.query(
     "select fidensa_api.transition_exercise_control($1,3,'review_pending',null,null,null,$2)",
@@ -2473,6 +2978,19 @@ async function testExerciseControl(db) {
   await db.query(
     "select fidensa_api.transition_exercise_control($1,5,'cleanup_pending',null,null,null,$2)",
     [exerciseId, "2041-01-01T01:04:00Z"],
+  );
+  await db.query("delete from fidensa_private.subscriptions where id=$1", [
+    subscriptionId,
+  ]);
+  invariant(
+    await scalar(
+      db,
+      `select subscription_id is null
+         from fidensa_private.provider_contact_state
+        where canonical_email=$1`,
+      ["exercise@synthetic.invalid"],
+    ),
+    "exercise fixture must prove cleanup of provider state already orphaned by subscription deletion",
   );
   await db.query("select fidensa_api.cleanup_exercise($1,$2)", [
     exerciseId,
@@ -2510,12 +3028,81 @@ async function testExerciseControl(db) {
       await scalar(
         db,
         `select count(*) from fidensa_private.application_terminal_guards
-         where application_id=$1 and terminal_state='deleted'
-           and reason='controlled_exercise_cleanup'`,
-        [stagedApplication],
+         where application_id=$1 or correlation_id=$2`,
+        [stagedApplication, correlation],
+      ),
+    ) === 0,
+    "bounded exercise cleanup must remove its transient terminal guard",
+  );
+  for (const [table, predicate, parameters] of [
+    ["applications", "correlation_id=$1", [correlation]],
+    ["verifications", "application_id=$1", [stagedApplication]],
+    ["privacy_acknowledgements", "application_id=$1", [stagedApplication]],
+    ["reviewer_status", "application_id=$1", [stagedApplication]],
+    ["reviewer_status_history", "application_id=$1", [stagedApplication]],
+    ["application_score_cohorts", "application_id=$1", [stagedApplication]],
+    ["score_sets", "application_id=$1", [stagedApplication]],
+    ["communications", "application_id=$1", [stagedApplication]],
+    ["subscriptions", "correlation_id=$1", [correlation]],
+    ["consent_acts", "application_id=$1", [stagedApplication]],
+    ["consent_history", "subscription_id=$1", [subscriptionId]],
+    ["subscription_sync_operations", "subscription_id=$1", [subscriptionId]],
+    [
+      "provider_contact_state",
+      "canonical_email=$1",
+      ["exercise@synthetic.invalid"],
+    ],
+    ["suppressions", "correlation_id=$1", [correlation]],
+    ["provider_events", "correlation_id=$1", [correlation]],
+    ["abuse_events", "correlation_id=$1", [correlation]],
+    ["operational_logs", "correlation_id=$1", [correlation]],
+    ["privacy_requests", "correlation_id=$1", [correlation]],
+    ["job_runs", "correlation_id=$1", [correlation]],
+    ["exercise_controls", "correlation_id=$1", [correlation]],
+  ]) {
+    invariant(
+      Number(
+        await scalar(
+          db,
+          `select count(*) from fidensa_private.${table} where ${predicate}`,
+          parameters,
+        ),
+      ) === 0,
+      `exercise cleanup must remove ${table}`,
+    );
+  }
+  const untaggedResidue = await untaggedExerciseWindowResidue(
+    db,
+    stagedOpensAt,
+    stagedExpiresAt,
+  );
+  invariant(
+    untaggedResidue.length > 1 &&
+      untaggedResidue.every(({ count }) => count === 0),
+    `every correlation-bearing Phase 02 table must have zero untagged exercise-window residue: ${JSON.stringify(untaggedResidue)}`,
+  );
+  invariant(
+    (await withRole(db, "service_role", () =>
+      scalar(db, "select fidensa_api.promotional_eligibility($1,$2)", [
+        "exercise@synthetic.invalid",
+        "updates-v1",
+      ]),
+    )) === "absent_consent",
+    "cleanup must prevent later marketing eligibility",
+  );
+  await expectRejected(
+    () => createExerciseGate(db, correlation),
+    "cleaned correlation resurrection",
+  );
+  invariant(
+    Number(
+      await scalar(
+        db,
+        "select count(*) from fidensa_private.acceptance_records where correlation_id=$1",
+        [correlation],
       ),
     ) === 1,
-    "exercise cleanup must leave immutable terminal anti-resurrection evidence",
+    "the bounded acceptance record must be the sole retained correlation record",
   );
   invariant(
     !(await withRole(db, "service_role", () =>
@@ -2526,7 +3113,58 @@ async function testExerciseControl(db) {
     )),
     "removed authoritative verifier must deny the old credential",
   );
-  console.log("PASS correlation-bound exercise gate and cleanup authority");
+  const postCleanupEffects = await applicationEffectSnapshot(db);
+  invariant(
+    !(await submitControlledIntake(db, {
+      label: "exercise-replay",
+      correlation,
+      now: new Date(stagedClock).toISOString(),
+      marketing: true,
+    })),
+    "post-cleanup submission replay must remain denied without recreating state",
+  );
+  invariant(
+    !(await verifyControlledIntake(
+      db,
+      "exercise",
+      new Date(stagedClock).toISOString(),
+    )),
+    "post-cleanup verification replay must remain denied without recreating state",
+  );
+  await expectRejected(
+    () =>
+      withRole(db, "service_role", () =>
+        db.query(
+          `select fidensa_api.record_provider_event(
+             $1,'contact.updated',$2,
+             'subscription',$3,'synthetic',$4,$5
+           )`,
+          [
+            digest("exercise-provider-event"),
+            new Date(stagedClock).toISOString(),
+            subscriptionId,
+            "exercise@synthetic.invalid",
+            correlation,
+          ],
+        ),
+      ),
+    "post-cleanup provider-event replay",
+  );
+  invariant(
+    JSON.stringify(await applicationEffectSnapshot(db)) ===
+      JSON.stringify(postCleanupEffects) &&
+      Number(
+        await scalar(
+          db,
+          "select count(*) from fidensa_private.provider_contact_state where canonical_email=$1",
+          ["exercise@synthetic.invalid"],
+        ),
+      ) === 0,
+    "post-cleanup submission, verification, and provider-event replay must not resurrect effects",
+  );
+  console.log(
+    "PASS exhaustive correlation-bound exercise cleanup, provider-state removal, and anti-resurrection",
+  );
 }
 
 async function testStudioOwnerBypassDenial(db) {
@@ -3919,7 +4557,7 @@ async function testConsentPrivacyOperations(db) {
     "activation must enqueue a versioned provider operation",
   );
   await db.query(
-    "select fidensa_api.record_subscription_review($1,2,'VERIFY-06-003:synthetic','permissive')",
+    "select fidensa_api.record_subscription_review($1,2,'phase-02-synthetic-review','permissive')",
     [subscriptionId],
   );
   const reviewedVersion = Number(
@@ -4102,7 +4740,7 @@ async function testConsentPrivacyOperations(db) {
     ),
   );
   await db.query(
-    "select fidensa_api.record_subscription_review($1,2,'VERIFY-06-003:provider-opt-out','permissive')",
+    "select fidensa_api.record_subscription_review($1,2,'phase-02-provider-opt-out-review','permissive')",
     [providerOptOutSubscription],
   );
   const laterVersionSync = await withRole(db, "service_role", () =>
@@ -4925,9 +5563,14 @@ async function testFirstActivationForwardUpgrade() {
     await bootstrapSupabaseRoleSurface(db);
     const migrations = await forwardMigrations();
     const guardIndex = migrations.indexOf(firstActivationGuardMigration);
+    const acceptanceIndex = migrations.indexOf(
+      controlledExerciseAcceptanceMigration,
+    );
     invariant(
-      guardIndex > 0 && guardIndex === migrations.length - 1,
-      "first-activation guard must be the final forward migration",
+      guardIndex > 0 &&
+        acceptanceIndex === guardIndex + 1 &&
+        acceptanceIndex === migrations.length - 1,
+      "first-activation guard must immediately precede the controlled-exercise acceptance migration",
     );
     await applyForwardAsStudioOwner(db, migrations.slice(0, guardIndex));
     await installTestFixturesAsStudioOwner(db);
@@ -5346,6 +5989,7 @@ async function main() {
     await testRetention(db);
     await testProviderAndPrivacyDomains(db);
     await testConsentPrivacyOperations(db);
+    await testExerciseGateRejections(db);
     await testExerciseControl(db);
     await testRecoveryAndRebuild(db, initialTableCount);
     console.log("DATABASE CONTRACT PASS");

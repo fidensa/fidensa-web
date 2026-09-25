@@ -8,6 +8,7 @@ import {
   requestIpIdentity,
 } from "./application-crypto";
 import { getServerConfig } from "./config";
+import { writeSafeLog } from "./log";
 import { createSupabaseGovernanceDatabase } from "./governance-database";
 import {
   createResendPrivacyConfirmationSender,
@@ -67,6 +68,12 @@ export function createRuntimePrivacyIntakeHandler() {
     digestEmailIdentity: (email) =>
       digestEmailIdentity(config.serverCredentials!.tokenMaterial, email),
     requestIpIdentity,
+    log: () =>
+      writeSafeLog({
+        environment: config.environment,
+        eventClass: "request_completed",
+        resultClass: "succeeded",
+      }),
   });
 }
 

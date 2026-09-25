@@ -16,6 +16,24 @@ export interface MarketingContactProvider {
   applyMarketingTopicSuppression(email: string): Promise<void>;
 }
 
+export interface MarketingContactCleanupProvider {
+  read(email: string): Promise<ProviderSnapshot>;
+  remove(email: string): Promise<void>;
+}
+
+export async function removeExerciseMarketingContact(
+  provider: MarketingContactCleanupProvider,
+  email: string,
+): Promise<void> {
+  await provider.remove(email);
+  const snapshot = await provider.read(email);
+  if (snapshot.exists || snapshot.topicSubscribed === true) {
+    throw new Error(
+      "Provider contact cleanup did not remove contact/topic state.",
+    );
+  }
+}
+
 export interface GlobalSuppressionSyncClaim {
   readonly operationId: string;
   readonly canonicalEmail: string;
@@ -162,7 +180,7 @@ export function createResendMarketingContactProvider(options: {
   readonly accessCredential: string;
   readonly marketingTopicId: string;
   readonly fetchImplementation?: typeof fetch;
-}): MarketingContactProvider {
+}): MarketingContactProvider & MarketingContactCleanupProvider {
   const fetchImplementation = options.fetchImplementation ?? fetch;
   if (options.accessCredential.length < 32 || !options.marketingTopicId) {
     throw new Error("The marketing reconciliation provider is not configured.");
@@ -360,6 +378,16 @@ export function createResendMarketingContactProvider(options: {
       );
       if (!response.ok && response.status !== 404) {
         throw new Error("Marketing topic suppression failed.");
+      }
+    },
+
+    async remove(email) {
+      const response = await fetchImplementation(
+        `https://api.resend.com/contacts/${encodeURIComponent(email)}`,
+        { method: "DELETE", headers },
+      );
+      if (!response.ok && response.status !== 404) {
+        throw new Error("Contact cleanup failed.");
       }
     },
   };

@@ -164,6 +164,7 @@ export function createPrivacyIntakeHandler(options: {
   readonly digestIpIdentity: (ip: string) => string;
   readonly digestEmailIdentity: (email: string) => string;
   readonly requestIpIdentity: (request: Request) => string;
+  readonly log?: () => void;
 }) {
   return async function handle(request: Request): Promise<Response> {
     let parsed: PrivacyIntake | null = null;
@@ -195,6 +196,7 @@ export function createPrivacyIntakeHandler(options: {
         },
       )
       .catch(() => undefined);
+    options.log?.();
     return Response.json(
       { message: GENERIC_PRIVACY_RESPONSE },
       { status: 200, headers: { "Cache-Control": "no-store, max-age=0" } },

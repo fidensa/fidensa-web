@@ -35,6 +35,8 @@ export interface ApplicationSubmissionRecord {
   readonly noticeVersion: string;
   readonly marketingSelected: boolean;
   readonly consentTextVersion: string | null;
+  readonly exerciseCorrelationId: string | null;
+  readonly exerciseRecipient: string | null;
 }
 
 export interface ApplicationDeliveryIntent {
@@ -273,6 +275,8 @@ export function createSupabaseApplicationDatabase({
           p_notice_version: record.noticeVersion,
           p_marketing_selected: record.marketingSelected,
           p_consent_text_version: record.consentTextVersion,
+          p_exercise_correlation_id: record.exerciseCorrelationId,
+          p_exercise_recipient: record.exerciseRecipient,
         }),
       );
     },

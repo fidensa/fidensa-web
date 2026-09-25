@@ -37,6 +37,8 @@ export type RuntimeConfig = BuildConfig &
       reviewerRecordBaseUrl: string;
       reviewerNotificationRecipient: string;
       marketingTopicId: string;
+      exerciseCorrelationId?: string;
+      exerciseRecipient?: string;
     }>;
   }>;
 
@@ -400,7 +402,42 @@ export function validateRuntimeEnvironment(
       "SERVER_RESEND_MARKETING_TOPIC_ID",
       "Resend marketing topic identity",
     ),
+    ...(build.environment === "staged-production"
+      ? {
+          exerciseCorrelationId: readRequired(
+            input,
+            "SERVER_EXERCISE_CORRELATION_ID",
+            "controlled exercise correlation",
+          ),
+          exerciseRecipient: readRequired(
+            input,
+            "SERVER_EXERCISE_RECIPIENT",
+            "controlled exercise recipient",
+          ).toLowerCase(),
+        }
+      : {}),
   };
+
+  if (
+    serverServices.exerciseCorrelationId &&
+    !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu.test(
+      serverServices.exerciseCorrelationId,
+    )
+  ) {
+    throw new EnvironmentValidationError(
+      "controlled exercise correlation",
+      "the value is not a UUID",
+    );
+  }
+  if (
+    serverServices.exerciseRecipient &&
+    !/^[^\s@]+@[^\s@]+\.[^\s@]+$/u.test(serverServices.exerciseRecipient)
+  ) {
+    throw new EnvironmentValidationError(
+      "controlled exercise recipient",
+      "the address is malformed",
+    );
+  }
 
   return { ...build, serverCredentials, serverServices };
 }

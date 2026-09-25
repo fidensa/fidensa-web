@@ -8,6 +8,7 @@ import { createSupabaseApplicationDatabase } from "./application-database";
 import { createResendAutomaticMessageSender } from "./application-messages";
 import { createApplicationService } from "./application-service";
 import { getServerConfig } from "./config";
+import { writeSafeLog } from "./log";
 
 const closedDatabase: ApplicationDatabase = {
   async submit() {
@@ -63,6 +64,12 @@ export function createRuntimeApplicationService() {
       siteOrigin: config.public.siteOrigin,
       reviewerRecordBaseUrl: `${config.public.siteOrigin}/closed-reviewer-records`,
       synthetic: true,
+      log: () =>
+        writeSafeLog({
+          environment: config.environment,
+          eventClass: "request_completed",
+          resultClass: "succeeded",
+        }),
       defer: (task) => after(task),
     });
   }
@@ -85,6 +92,19 @@ export function createRuntimeApplicationService() {
     siteOrigin: config.public.siteOrigin,
     reviewerRecordBaseUrl: config.serverServices.reviewerRecordBaseUrl,
     synthetic: config.environment !== "production",
+    log: () =>
+      writeSafeLog({
+        environment: config.environment,
+        eventClass: "request_completed",
+        resultClass: "succeeded",
+      }),
+    exerciseAuthority:
+      config.environment === "staged-production"
+        ? {
+            correlationId: config.serverServices.exerciseCorrelationId!,
+            exactRecipient: config.serverServices.exerciseRecipient!,
+          }
+        : undefined,
     defer: (task) => after(task),
   });
 }

@@ -42,6 +42,13 @@ function productionEnvironment(
       "https://supabase.com/dashboard/project/project/editor/records",
     SERVER_REVIEWER_NOTIFICATION_RECIPIENT: "reviewer@fidensa.example",
     SERVER_RESEND_MARKETING_TOPIC_ID: "00000000-0000-4000-8000-000000000001",
+    ...(environment === "staged-production"
+      ? {
+          SERVER_EXERCISE_CORRELATION_ID:
+            "00000000-0000-4000-8000-000000000201",
+          SERVER_EXERCISE_RECIPIENT: "exercise@synthetic.invalid",
+        }
+      : {}),
   };
 }
 

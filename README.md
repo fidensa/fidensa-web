@@ -37,6 +37,28 @@ Local and test environments accept only synthetic/deterministic provider posture
 
 Evidence state is closed: absent, unknown, contradictory, or attempted accepted input resolves to the application-only presentation. Public evidence publication remains deliberately unavailable here.
 
+### Controlled-exercise integration obligations
+
+The local acceptance helpers are deliberately not wired to a public route or a
+live provider in this tree. `TASK-02-006` must seal the redacted immutable
+`CE-02-v1.0` packet and call `validateControlledEvidencePacket` before creating
+or advancing its candidate acceptance record. Any validation error stops the
+exercise; the task must persist the exact validated packet bytes and digest,
+and must recapture rather than edit an accepted packet. No Shareable Link,
+Automation Bypass, fixture-verifier, provider, or other bearer value may be
+passed to the validator as evidence content.
+
+`TASK-02-008` must instantiate the server-only Resend contact provider with the
+separately provisioned management credential, call
+`removeExerciseMarketingContact` for the exercise control's exact recipient,
+and require its absent-contact/absent-topic read-back before invoking database
+cleanup. A provider error or persisting contact/topic state leaves the exercise
+protected, intake closed, marketing ineligible, and cleanup pending. Only then
+may the operator call the correlation-bound `cleanup_exercise` operation and
+record the immutable cleanup result. These are safe integration obligations,
+not authorization for this repository task to deploy, configure credentials,
+call a live provider, or apply a remote migration.
+
 ## Security and privacy defaults
 
 `next.config.ts` applies the fixed non-CSP baseline to every response, including framework-served assets. `proxy.ts` adds the versioned per-response CSP and route-class cache policy to application and error responses. Test uses production CSP semantics; local development adds only the loopback/eval allowances required for hot reload. HSTS is emitted only for HTTPS production-class requests. Application HTML and error responses are `no-store`; fingerprinted public assets may retain immutable caching.
