@@ -1,6 +1,6 @@
-# Fidensa web foundation
+# Fidensa web application foundation
 
-This repository is the Phase 01 Next.js and TypeScript foundation. Its route copy is intentionally neutral and temporary. It does not implement the application workflow, provider mutations, public evidence artifacts, deployment, or final legal/product content.
+This repository contains the Next.js and TypeScript website foundation plus the protected application database contract. Its public route copy is intentionally neutral and temporary. Provider mutations, deployment, and final legal/product content remain outside this repository state.
 
 ## Supported toolchain
 
@@ -25,7 +25,7 @@ npm run verify:routes
 npm run verify
 ```
 
-`npm run verify` is the complete foundation check. `npm run build` supplies bounded test defaults only when neither `APP_ENV` nor a Vercel environment identity exists. A staged or production-class build must provide its explicit configuration and never inherits those defaults. The route verifier starts the already-built server on loopback and executes the versioned GET/HEAD route manifest.
+`npm run verify` is the complete repository check. `npm run build` supplies bounded test defaults only when neither `APP_ENV` nor a Vercel environment identity exists. A staged or production-class build must provide its explicit configuration and never inherits those defaults. The route verifier starts the already-built server on loopback and executes the versioned GET/HEAD route manifest.
 
 The machine's user-level npm cache is not part of the repository. A writable disposable cache can be supplied with `--cache` as shown for clean installation.
 
@@ -35,7 +35,7 @@ The machine's user-level npm cache is not part of the repository. A writable dis
 
 Local and test environments accept only synthetic/deterministic provider posture and captured delivery. Staged-production and production builds require HTTPS, immutable build/deployment/configuration identities, and production provider posture. Build validation rejects provider-prefixed or sensitive public names and public values that duplicate any supplied server credential material. The server-only credential categories are validated by `getServerConfig()` at first privileged use; no privileged provider operation exists in this foundation. Future adapters must obtain configuration through that fail-closed function before doing work. Validation errors identify a category but never echo a supplied value.
 
-Evidence state is closed: absent, unknown, contradictory, or attempted accepted input resolves to the application-only presentation. The later acceptance-record contract is deliberately not implemented here.
+Evidence state is closed: absent, unknown, contradictory, or attempted accepted input resolves to the application-only presentation. Public evidence publication remains deliberately unavailable here.
 
 ## Security and privacy defaults
 
@@ -45,7 +45,7 @@ Structured logging is allowlisted. Arbitrary request bodies, headers, query stri
 
 ## Database migrations
 
-Future database changes belong in `migrations/` and follow its documented naming and review convention. Phase 01 contains no production schema.
+Database changes belong in `migrations/` and follow its documented naming and review convention. The protected application schema is defined there and is exercised only against isolated local database instances by this repository's verification commands.
 
 ## Compatibility and accessibility
 

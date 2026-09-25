@@ -5,6 +5,7 @@ const root = process.cwd();
 const skippedDirectories = new Set([
   ".git",
   ".next",
+  ".npm-cache",
   ".claude",
   "node_modules",
   "coverage",
@@ -97,9 +98,33 @@ if (sourceFiles.some((file) => competingLocks.includes(file))) {
 const migrationFiles = sourceFiles.filter((file) =>
   file.startsWith("migrations/"),
 );
-if (migrationFiles.some((file) => file !== "migrations/README.md")) {
-  throw new Error("A production migration appeared before its approved phase.");
+const approvedMigrationFiles = new Set([
+  "migrations/README.md",
+  "migrations/20260924221000_protected_application_database.sql",
+  "migrations/20260924222000_constrained_operations_and_queue.sql",
+  "migrations/20260924222500_security_and_exercise_operations.sql",
+  "migrations/20260924223000_retention_jobs.sql",
+  "migrations/20260924223500_review_closure_guards.sql",
+  "migrations/20260924224000_owner_authority_hardening.sql",
+  "migrations/20260924224500_authoritative_time_and_health_retry_guards.sql",
+  "migrations/20260924225000_lifecycle_and_retention_anchor_guards.sql",
+  "migrations/20260924225500_schedule_and_truncate_guards.sql",
+  "migrations/recovery/20260924223000_drop_protected_application_database.sql",
+]);
+if (
+  migrationFiles.length !== approvedMigrationFiles.size ||
+  migrationFiles.some((file) => !approvedMigrationFiles.has(file))
+) {
+  throw new Error(
+    "The migration inventory differs from the approved application database set.",
+  );
 }
+
+await scanFiles(
+  clientFiles,
+  ["fidensa_private", "SERVER_DATA_ACCESS_CREDENTIAL"],
+  "private database locator or server credential category in client output",
+);
 
 process.stdout.write(
   `Artifact inspection passed: ${sourceFiles.length} governed source files, ${clientFiles.length} client build files, ${serverFiles.length} server build files.\n`,
