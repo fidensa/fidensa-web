@@ -93,6 +93,42 @@ schedule configured by the deployment task. The migration also records
 honeypot denials as 48-hour abuse events. It grants no table, private-schema,
 or queue access.
 
+The consent/suppression/privacy migration adds a separate durable subscription
+sync outbox, provider read-back snapshots, quarterly review authority,
+most-restrictive promotional eligibility, signed-event normalization targets,
+draft-only manual templates, and scope-bound privacy operations. Retry always
+reads provider state before mutation; a newer or terminal Supabase version
+supersedes older provider work. Application-only rights deletion preserves an
+active minimal subscription, while subscription scope creates a terminal
+versioned opt-out operation. The `25 * * * *` reconciliation entry point is
+server-authenticated and remains inert until the deployment task installs the
+separate contact-management credential and marketing topic identity.
+
+A forward delivery-guard migration, applied only after the suppression domain
+exists, makes the existing transactional outbox refuse applicant delivery under
+an effective global suppression while preserving the minimal internal reviewer
+notification. The accepted application-delivery migration remains byte-clean.
+
+The following forward migration hardens partial first activation without
+editing the consent migration: an existing contact with a non-opted-in topic is
+kept in reconciliation until a successful active topic read-back exists. Only
+after that durable first-activation evidence may a later provider topic opt-out
+be imported as a recipient restriction. The migration repeats the narrow
+function revoke/grant boundary and is exercised both as an upgrade over the
+prior chain and in clean rebuilds.
+
+Resend's primary Webhooks verification, Event Types, Contacts, and Topics
+documentation and the provider OpenAPI 1.5.0 contract were rechecked on
+2026-09-25. Verification uses the untouched raw body with `svix-id`,
+`svix-timestamp`, and `svix-signature`. The implemented event set is
+`email.bounced`, `email.complained`, `email.suppressed`, `contact.updated`,
+`contact.deleted`, `suppression.added`, and `suppression.removed`; uncertain or
+relaxing events close eligibility until authenticated read-back reconciles.
+Contact-topic read-back follows every `has_more` page before deciding whether
+the marketing topic is present. First-activation retry updates an existing
+contact rather than issuing a duplicate create, and treats an absent or unset
+topic as incomplete activation work until an active topic read-back succeeds.
+
 Current Supabase Cron and database-backup documentation was rechecked on
 2026-09-24. Cron uses `pg_cron`, can invoke database functions directly, and
 records provider run history in `cron.job_run_details`; the migration bounds

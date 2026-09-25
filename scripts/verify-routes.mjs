@@ -201,6 +201,11 @@ try {
     "/api/applications/resend",
     "/api/applications/verify",
     "/api/internal/application-messages/reconcile",
+    "/api/internal/consent/reconcile",
+    "/api/internal/privacy/confirmations/reconcile",
+    "/api/privacy/requests",
+    "/api/privacy/requests/confirm",
+    "/api/webhooks/resend",
   ]) {
     const get = await fetch(`${baseUrl}${pathName}`, { redirect: "manual" });
     if (get.status !== 405 || get.headers.get("allow") !== "POST") {
@@ -221,6 +226,34 @@ try {
     throw new Error("Reconciliation entry point did not fail closed.");
   }
 
+  const unauthorizedConsentReconciliation = await fetch(
+    `${baseUrl}/api/internal/consent/reconcile`,
+    { method: "POST" },
+  );
+  if (
+    unauthorizedConsentReconciliation.status !== 404 ||
+    !unauthorizedConsentReconciliation.headers
+      .get("cache-control")
+      ?.includes("no-store")
+  ) {
+    throw new Error("Consent reconciliation entry point did not fail closed.");
+  }
+
+  const unauthorizedPrivacyReconciliation = await fetch(
+    `${baseUrl}/api/internal/privacy/confirmations/reconcile`,
+    { method: "POST" },
+  );
+  if (
+    unauthorizedPrivacyReconciliation.status !== 404 ||
+    !unauthorizedPrivacyReconciliation.headers
+      .get("cache-control")
+      ?.includes("no-store")
+  ) {
+    throw new Error(
+      "Privacy confirmation reconciliation entry point did not fail closed.",
+    );
+  }
+
   const verify = await fetch(`${baseUrl}/api/applications/verify`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -234,6 +267,23 @@ try {
   ) {
     throw new Error(
       "Verification API did not return its generic no-store outcome.",
+    );
+  }
+
+  const privacyConfirmation = await fetch(
+    `${baseUrl}/api/privacy/requests/confirm`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ credential: "malformed" }),
+    },
+  );
+  if (
+    privacyConfirmation.status !== 503 ||
+    !privacyConfirmation.headers.get("cache-control")?.includes("no-store")
+  ) {
+    throw new Error(
+      "Unconfigured privacy confirmation API did not fail closed.",
     );
   }
 

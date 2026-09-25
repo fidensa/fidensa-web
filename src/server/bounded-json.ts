@@ -7,13 +7,10 @@ export class RequestBodyError extends Error {
   }
 }
 
-export async function readBoundedJson(
+export async function readBoundedText(
   request: Request,
   maximumBytes: number,
-): Promise<unknown> {
-  const contentType = request.headers.get("content-type")?.split(";", 1)[0];
-  if (contentType !== "application/json")
-    throw new RequestBodyError("content-type");
+): Promise<string> {
   const declared = request.headers.get("content-length");
   if (declared && Number(declared) > maximumBytes) {
     throw new RequestBodyError("size");
@@ -40,8 +37,23 @@ export async function readBoundedJson(
     offset += chunk.byteLength;
   }
   try {
-    return JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes));
+    return new TextDecoder("utf-8", { fatal: true }).decode(bytes);
   } catch {
+    throw new RequestBodyError("json");
+  }
+}
+
+export async function readBoundedJson(
+  request: Request,
+  maximumBytes: number,
+): Promise<unknown> {
+  const contentType = request.headers.get("content-type")?.split(";", 1)[0];
+  if (contentType !== "application/json")
+    throw new RequestBodyError("content-type");
+  try {
+    return JSON.parse(await readBoundedText(request, maximumBytes));
+  } catch (error) {
+    if (error instanceof RequestBodyError) throw error;
     throw new RequestBodyError("json");
   }
 }

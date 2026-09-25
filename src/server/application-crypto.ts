@@ -27,6 +27,17 @@ export function digestOperationKey(material: string, key: string): string {
   return hmac(material, "application_submission", key);
 }
 
+export function issuePrivacyConfirmationCredential(): string {
+  return `pr1.${randomBytes(16).toString("base64url")}`;
+}
+
+export function digestPrivacyConfirmationCredential(
+  material: string,
+  credential: string,
+): string {
+  return hmac(material, "privacy_confirmation", credential);
+}
+
 export function digestEmailIdentity(material: string, email: string): string {
   return hmac(material, "application_email_rate", email);
 }

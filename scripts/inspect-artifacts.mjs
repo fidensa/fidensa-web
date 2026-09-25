@@ -118,6 +118,9 @@ const approvedMigrationFiles = new Set([
   "migrations/20260924225000_lifecycle_and_retention_anchor_guards.sql",
   "migrations/20260924225500_schedule_and_truncate_guards.sql",
   "migrations/20260925100000_application_delivery_intents.sql",
+  "migrations/20260925101000_consent_suppression_privacy_operations.sql",
+  "migrations/20260925101500_global_suppression_delivery_guard.sql",
+  "migrations/20260925102000_first_activation_reconciliation_guard.sql",
   "migrations/recovery/20260924223000_drop_protected_application_database.sql",
 ]);
 if (

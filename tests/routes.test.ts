@@ -81,4 +81,43 @@ describe("baseline route source", () => {
     expect(source).toContain("timingSafeEqual");
     expect(runtime).toContain('APPLICATION_RECONCILIATION_CRON = "10 * * * *"');
   });
+
+  it("defines consent reconciliation, webhook, and generic rights entry points", async () => {
+    const runtime = await readFile(
+      path.join(root, "src/server/governance-runtime.ts"),
+      "utf8",
+    );
+    const webhook = await readFile(
+      path.join(root, "src/app/api/webhooks/resend/route.ts"),
+      "utf8",
+    );
+    const privacy = await readFile(
+      path.join(root, "src/app/api/privacy/requests/route.ts"),
+      "utf8",
+    );
+    const privacyConfirmation = await readFile(
+      path.join(root, "src/app/api/privacy/requests/confirm/route.ts"),
+      "utf8",
+    );
+    const privacyReconciliation = await readFile(
+      path.join(
+        root,
+        "src/app/api/internal/privacy/confirmations/reconcile/route.ts",
+      ),
+      "utf8",
+    );
+    expect(runtime).toContain('CONSENT_RECONCILIATION_CRON = "25 * * * *"');
+    expect(runtime).toContain(
+      'PRIVACY_CONFIRMATION_RECONCILIATION_CRON = "40 * * * *"',
+    );
+    expect(webhook).toContain("createRuntimeResendWebhookHandler");
+    expect(privacy).toContain("createRuntimePrivacyIntakeHandler");
+    expect(privacyConfirmation).toContain(
+      "createRuntimePrivacyConfirmationHandler",
+    );
+    expect(privacyReconciliation).toContain("timingSafeEqual");
+    expect(privacyReconciliation).toContain(
+      "reconcileRuntimePrivacyConfirmations",
+    );
+  });
 });

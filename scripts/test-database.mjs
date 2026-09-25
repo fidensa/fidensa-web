@@ -13,6 +13,10 @@ const testFixtureSetup = new URL(
   "tests/fixtures/application-database-fixtures.sql",
   root,
 );
+const firstActivationGuardMigration =
+  "20260925102000_first_activation_reconciliation_guard.sql";
+const globalSuppressionDeliveryGuardMigration =
+  "20260925101500_global_suppression_delivery_guard.sql";
 
 function invariant(condition, message) {
   if (!condition) throw new Error(message);
@@ -67,10 +71,18 @@ async function createTestFixture(
 
 async function withRole(db, role, action) {
   await db.exec(`set role ${role}`);
+  let primaryError;
   try {
     return await action();
+  } catch (error) {
+    primaryError = error;
+    throw error;
   } finally {
-    await db.exec("reset role");
+    try {
+      await db.exec("reset role");
+    } catch (resetError) {
+      if (!primaryError) throw resetError;
+    }
   }
 }
 
@@ -223,10 +235,11 @@ async function bootstrapSupabaseRoleSurface(db) {
   `);
 }
 
-async function applyForwardAsStudioOwner(db) {
+async function applyForwardAsStudioOwner(db, migrations) {
+  const selectedMigrations = migrations ?? (await forwardMigrations());
   await db.exec("set role fidensa_studio_owner");
   try {
-    for (const name of await forwardMigrations()) {
+    for (const name of selectedMigrations) {
       // A production apply keeps the migration's Staged-production default.
       // The isolated harness opts into Test before the final authority lock;
       // once locked, test-clock configuration requires that existing state.
@@ -241,6 +254,15 @@ async function applyForwardAsStudioOwner(db) {
   } catch (error) {
     await db.exec("rollback");
     throw error;
+  } finally {
+    await db.exec("reset role");
+  }
+}
+
+async function applyOneForwardAsStudioOwner(db, name) {
+  await db.exec("set role fidensa_studio_owner");
+  try {
+    await db.exec(await readFile(new URL(name, migrationsDirectory), "utf8"));
   } finally {
     await db.exec("reset role");
   }
@@ -334,6 +356,36 @@ async function verify(db, label, now = "2039-01-01T00:01:00Z") {
       digest(`${label}:verification`),
       digest(`${label}:verify-ip`),
     ]),
+  );
+}
+
+async function confirmPrivacyRequest(db, requestId, scope, label) {
+  await db.query(
+    "select fidensa_api.record_privacy_confirmation_intent($1,1,$2,'scott_bishop')",
+    [requestId, scope],
+  );
+  const claim = await withRole(db, "service_role", () =>
+    scalar(db, "select fidensa_api.claim_privacy_confirmation_intent()"),
+  );
+  invariant(claim?.privacyRequestId === requestId, `${label} intent mismatch`);
+  const credential = digest(`${label}:confirmation`);
+  await withRole(db, "service_role", () =>
+    db.query("select fidensa_api.issue_privacy_confirmation($1,$2)", [
+      claim.intentId,
+      credential,
+    ]),
+  );
+  invariant(
+    (await withRole(db, "service_role", () =>
+      scalar(db, "select fidensa_api.consume_privacy_confirmation($1)", [
+        credential,
+      ]),
+    )) === true,
+    `${label} confirmation must be consumed`,
+  );
+  await db.query(
+    "select fidensa_api.transition_privacy_request($1,2,'under_review',$2,$3,'scott_bishop')",
+    [requestId, scope, `${label} review`],
   );
 }
 
@@ -568,8 +620,8 @@ async function testCatalogAndAccess(db) {
         `select count(*) from pg_proc p join pg_namespace n on n.oid=p.pronamespace
          where n.nspname='fidensa_api' and has_function_privilege('service_role',p.oid,'execute')`,
       ),
-    ) === 13,
-    "server secret role must receive only the thirteen server operations",
+    ) === 24,
+    "server secret role must receive only the twenty-four bounded server operations",
   );
   for (const operation of ["run_current_retention", "run_retention_health"]) {
     await withRole(db, "service_role", () =>
@@ -884,7 +936,11 @@ async function testApplicationDeliveryIntents(db) {
     "an ambiguous verification send without provider identity must never retry an unrecoverable credential",
   );
 
-  async function seedOutbox(type, operationTime) {
+  async function seedOutbox(
+    type,
+    operationTime,
+    applicationId = submissionIntent.applicationId,
+  ) {
     await configureTestAuthority(db, operationTime);
     const operationId = await scalar(
       db,
@@ -905,10 +961,100 @@ async function testApplicationDeliveryIntents(db) {
                   fidensa_private.authoritative_now(),fidensa_private.authoritative_now()
              from communication
        ) select operation_id from communication`,
-      [submissionIntent.applicationId, type],
+      [applicationId, type],
     );
     return operationId;
   }
+
+  const scopeLabel = "application-mail-scope";
+  const scopeEmail = `${scopeLabel}@synthetic.invalid`;
+  const scopeApplicationId = await submit(db, {
+    label: scopeLabel,
+    email: scopeEmail,
+    now: "2039-01-02T00:08:00Z",
+    marketing: true,
+  });
+  await verify(db, scopeLabel, "2039-01-02T00:09:00Z");
+  await configureTestAuthority(db, "2039-01-02T00:10:00Z");
+  await withRole(db, "service_role", () =>
+    db.query(
+      "select fidensa_api.record_provider_event_v2($1,'contact.updated',$2,$3,'marketing_topic','marketing_unsubscribe',false)",
+      [
+        digest("application-mail-topic-unsubscribe"),
+        "2039-01-02T00:10:00Z",
+        scopeEmail,
+      ],
+    ),
+  );
+  const topicScopedApplicationMessage = await seedOutbox(
+    "receipt",
+    "2039-01-02T00:11:00Z",
+    scopeApplicationId,
+  );
+  invariant(
+    (
+      await withRole(db, "service_role", () =>
+        scalar(db, "select fidensa_api.claim_application_message($1)", [
+          topicScopedApplicationMessage,
+        ]),
+      )
+    )?.messageType === "application_receipt",
+    "marketing-topic unsubscribe must not block necessary application communications",
+  );
+  await withRole(db, "service_role", () =>
+    db.query(
+      "select fidensa_api.record_application_message_outcome($1,'accepted_by_provider',$2,$3)",
+      [
+        topicScopedApplicationMessage,
+        digest("topic-scope-application-message"),
+        "topic-scope-application-message",
+      ],
+    ),
+  );
+
+  await configureTestAuthority(db, "2039-01-02T00:12:00Z");
+  await db.query(
+    "select fidensa_api.record_complete_do_not_contact($1,'synthetic-complete-dnc','scott_bishop')",
+    [scopeEmail],
+  );
+  const globallyBlockedApplicationMessage = await seedOutbox(
+    "receipt",
+    "2039-01-02T00:13:00Z",
+    scopeApplicationId,
+  );
+  const globalReviewerMessage = await seedOutbox(
+    "reviewer_notification",
+    "2039-01-02T00:13:00Z",
+    scopeApplicationId,
+  );
+  invariant(
+    (await withRole(db, "service_role", () =>
+      scalar(db, "select fidensa_api.claim_application_message($1)", [
+        globallyBlockedApplicationMessage,
+      ]),
+    )) === null &&
+      (
+        await withRole(db, "service_role", () =>
+          scalar(db, "select fidensa_api.claim_application_message($1)", [
+            globalReviewerMessage,
+          ]),
+        )
+      )?.messageType === "reviewer_notification",
+    "global do-not-contact must block applicant delivery while leaving the internal reviewer notice path distinct",
+  );
+  const globalSuppressionClaim = await withRole(db, "service_role", () =>
+    scalar(db, "select fidensa_api.claim_global_suppression_sync()"),
+  );
+  invariant(
+    globalSuppressionClaim?.canonicalEmail === scopeEmail,
+    "a global restriction must queue idempotent provider suppression reconciliation",
+  );
+  await withRole(db, "service_role", () =>
+    db.query(
+      "select fidensa_api.record_global_suppression_sync_result($1,'applied')",
+      [globalSuppressionClaim.operationId],
+    ),
+  );
 
   const missedOperation = await seedOutbox("receipt", "2039-01-02T01:00:00Z");
   await configureTestAuthority(db, "2039-01-02T03:00:00Z");
@@ -3725,6 +3871,1168 @@ async function testProviderAndPrivacyDomains(db) {
   );
 }
 
+async function testConsentPrivacyOperations(db) {
+  for (let index = 0; index < 100; index += 1) {
+    const priorClaim = await withRole(db, "service_role", () =>
+      scalar(db, "select fidensa_api.claim_subscription_sync()"),
+    );
+    if (!priorClaim) break;
+    await withRole(db, "service_role", () =>
+      db.query(
+        "select fidensa_api.record_subscription_sync_result($1,'applied',true,true,false)",
+        [priorClaim.operationId],
+      ),
+    );
+  }
+  const label = "governance-v2";
+  const email = `${label}@synthetic.invalid`;
+  const applicationId = await submit(db, {
+    label,
+    email,
+    now: "2043-01-01T00:00:00Z",
+    marketing: true,
+  });
+  invariant(applicationId, "selected consent fixture must persist");
+  invariant(
+    await verify(db, label, "2043-01-01T00:01:00Z"),
+    "selected consent fixture must verify",
+  );
+  const subscriptionId = await scalar(
+    db,
+    "select id from fidensa_private.subscriptions where application_id=$1",
+    [applicationId],
+  );
+  invariant(
+    (await withRole(db, "service_role", () =>
+      scalar(db, "select fidensa_api.promotional_eligibility($1,$2)", [
+        email,
+        "updates-v1",
+      ]),
+    )) === "review_not_permissive",
+    "promotion must deny before a current quarterly review",
+  );
+  const superseded = await withRole(db, "service_role", () =>
+    scalar(db, "select fidensa_api.claim_subscription_sync()"),
+  );
+  invariant(
+    superseded?.subscriptionVersion === 2,
+    "activation must enqueue a versioned provider operation",
+  );
+  await db.query(
+    "select fidensa_api.record_subscription_review($1,2,'VERIFY-06-003:synthetic','permissive')",
+    [subscriptionId],
+  );
+  const reviewedVersion = Number(
+    await scalar(
+      db,
+      "select version from fidensa_private.subscriptions where id=$1",
+      [subscriptionId],
+    ),
+  );
+  invariant(
+    reviewedVersion === 3,
+    "quarterly review must advance consent version",
+  );
+  invariant(
+    Number(
+      await scalar(
+        db,
+        "select subscription_version from fidensa_private.subscription_sync_operations where operation_id=$1",
+        [superseded.operationId],
+      ),
+    ) === 2,
+    "claimed sync operation must retain its immutable version",
+  );
+  invariant(
+    (await withRole(db, "service_role", () =>
+      scalar(db, "select fidensa_api.promotional_eligibility($1,$2)", [
+        email,
+        "updates-v1",
+      ]),
+    )) === "provider_unavailable",
+    "a passing local review must still deny until provider read-back matches",
+  );
+  await withRole(db, "service_role", () =>
+    db.query(
+      "select fidensa_api.record_subscription_sync_result($1,'applied',true,true,false)",
+      [superseded.operationId],
+    ),
+  );
+  const supersededState = await scalar(
+    db,
+    "select state from fidensa_private.subscription_sync_operations where operation_id=$1",
+    [superseded.operationId],
+  );
+  invariant(
+    supersededState === "superseded",
+    `a late successful provider response must not overwrite a newer subscription version (${supersededState})`,
+  );
+  const current = await withRole(db, "service_role", () =>
+    scalar(db, "select fidensa_api.claim_subscription_sync()"),
+  );
+  invariant(
+    current?.subscriptionVersion === 3 &&
+      current?.reconcileFirst === false &&
+      current?.firstActivationConfirmed === true &&
+      (await scalar(
+        db,
+        "select first_active_read_back_at is not null from fidensa_private.provider_contact_state where canonical_email=$1",
+        [email],
+      )),
+    "quarterly review must queue the current version and carry the superseded operation's successful activation read-back",
+  );
+  await withRole(db, "service_role", () =>
+    db.query(
+      "select fidensa_api.record_subscription_sync_result($1,'applied',true,true,false)",
+      [current.operationId],
+    ),
+  );
+  invariant(
+    (await withRole(db, "service_role", () =>
+      scalar(db, "select fidensa_api.promotional_eligibility($1,$2)", [
+        email,
+        "updates-v1",
+      ]),
+    )) === "eligible",
+    "matching current Supabase and provider facts must permit promotion",
+  );
+
+  await configureTestAuthority(db, "2043-01-01T01:00:00Z");
+  const partialActivationLabel = "partial-first-activation";
+  const partialActivationEmail = `${partialActivationLabel}@synthetic.invalid`;
+  const partialActivationApplication = await submit(db, {
+    label: partialActivationLabel,
+    email: partialActivationEmail,
+    now: "2043-01-01T01:00:00Z",
+    marketing: true,
+  });
+  await verify(db, partialActivationLabel, "2043-01-01T01:01:00Z");
+  const partialActivationSubscription = await scalar(
+    db,
+    "select id from fidensa_private.subscriptions where application_id=$1",
+    [partialActivationApplication],
+  );
+  const partialActivation = await withRole(db, "service_role", () =>
+    scalar(db, "select fidensa_api.claim_subscription_sync()"),
+  );
+  invariant(
+    partialActivation?.firstActivationConfirmed === false,
+    "partial first activation must begin without durable activation evidence",
+  );
+  await withRole(db, "service_role", () =>
+    db.query(
+      "select fidensa_api.record_subscription_sync_result($1,'applied',true,false,false)",
+      [partialActivation.operationId],
+    ),
+  );
+  invariant(
+    (await scalar(
+      db,
+      "select state::text from fidensa_private.subscription_sync_operations where operation_id=$1",
+      [partialActivation.operationId],
+    )) === "needs_reconciliation" &&
+      (await scalar(
+        db,
+        "select state::text from fidensa_private.subscriptions where id=$1",
+        [partialActivationSubscription],
+      )) === "active" &&
+      Number(
+        await scalar(
+          db,
+          "select count(*) from fidensa_private.suppressions where canonical_email=$1 and state='effective'",
+          [partialActivationEmail],
+        ),
+      ) === 0,
+    "partial first topic activation must stay retryable without fabricating a recipient opt-out",
+  );
+  const partialRetry = await withRole(db, "service_role", () =>
+    scalar(db, "select fidensa_api.claim_subscription_sync()"),
+  );
+  invariant(
+    partialRetry?.operationId === partialActivation.operationId &&
+      partialRetry?.firstActivationConfirmed === false,
+    "partial first activation must reclaim the same operation without fabricated activation evidence",
+  );
+  await withRole(db, "service_role", () =>
+    db.query(
+      "select fidensa_api.record_subscription_sync_result($1,'applied',true,true,false)",
+      [partialRetry.operationId],
+    ),
+  );
+  invariant(
+    (await scalar(
+      db,
+      "select state::text from fidensa_private.subscription_sync_operations where operation_id=$1",
+      [partialActivation.operationId],
+    )) === "applied" &&
+      (await scalar(
+        db,
+        "select first_active_read_back_at is not null from fidensa_private.provider_contact_state where canonical_email=$1",
+        [partialActivationEmail],
+      )),
+    "successful retry must durably complete the first active provider read-back",
+  );
+
+  await configureTestAuthority(db, "2043-01-02T00:00:00Z");
+  const providerOptOutLabel = "provider-topic-opt-out";
+  const providerOptOutEmail = `${providerOptOutLabel}@synthetic.invalid`;
+  const providerOptOutApplication = await submit(db, {
+    label: providerOptOutLabel,
+    email: providerOptOutEmail,
+    now: "2043-01-02T00:00:00Z",
+    marketing: true,
+  });
+  await verify(db, providerOptOutLabel, "2043-01-02T00:01:00Z");
+  const providerOptOutSubscription = await scalar(
+    db,
+    "select id from fidensa_private.subscriptions where application_id=$1",
+    [providerOptOutApplication],
+  );
+  const firstActivation = await withRole(db, "service_role", () =>
+    scalar(db, "select fidensa_api.claim_subscription_sync()"),
+  );
+  invariant(
+    firstActivation?.subscriptionVersion === 2,
+    "first provider activation must be independently versioned",
+  );
+  await withRole(db, "service_role", () =>
+    db.query(
+      "select fidensa_api.record_subscription_sync_result($1,'applied',true,true,false)",
+      [firstActivation.operationId],
+    ),
+  );
+  await db.query(
+    "select fidensa_api.record_subscription_review($1,2,'VERIFY-06-003:provider-opt-out','permissive')",
+    [providerOptOutSubscription],
+  );
+  const laterVersionSync = await withRole(db, "service_role", () =>
+    scalar(db, "select fidensa_api.claim_subscription_sync()"),
+  );
+  invariant(
+    laterVersionSync?.subscriptionVersion === 3,
+    "later consent review must reconcile without assuming provider permission",
+  );
+  await withRole(db, "service_role", () =>
+    db.query(
+      "select fidensa_api.record_subscription_sync_result($1,'applied',true,false,false)",
+      [laterVersionSync.operationId],
+    ),
+  );
+  invariant(
+    (await scalar(
+      db,
+      "select state::text from fidensa_private.subscriptions where id=$1",
+      [providerOptOutSubscription],
+    )) === "unsubscribed" &&
+      Number(
+        await scalar(
+          db,
+          "select count(*) from fidensa_private.suppressions where canonical_email=$1 and scope='marketing_topic' and state='effective' and reason='provider_marketing_opt_out'",
+          [providerOptOutEmail],
+        ),
+      ) === 1,
+    "provider topic opt-out read-back must become a local restriction without re-subscription",
+  );
+
+  await configureTestAuthority(db, "2043-04-01T00:01:00Z");
+  invariant(
+    (await withRole(db, "service_role", () =>
+      scalar(db, "select fidensa_api.promotional_eligibility($1,$2)", [
+        email,
+        "updates-v1",
+      ]),
+    )) === "review_overdue",
+    "the fixed-clock quarterly boundary must deny promotion",
+  );
+
+  const unsubscribeDigest = digest("governance-v2-unsubscribe");
+  invariant(
+    (await withRole(db, "service_role", () =>
+      scalar(
+        db,
+        "select fidensa_api.record_provider_event_v2($1,'contact.updated',$2,$3,'marketing_topic','marketing_unsubscribe',false)",
+        [unsubscribeDigest, "2043-04-01T00:00:59Z", email],
+      ),
+    )) === "applied",
+    "authenticated marketing unsubscribe must apply",
+  );
+  invariant(
+    (await withRole(db, "service_role", () =>
+      scalar(
+        db,
+        "select fidensa_api.record_provider_event_v2($1,'contact.updated',$2,$3,'marketing_topic','marketing_unsubscribe',false)",
+        [unsubscribeDigest, "2043-04-01T00:00:59Z", email],
+      ),
+    )) === "duplicate" &&
+      (await scalar(
+        db,
+        "select state::text from fidensa_private.subscriptions where id=$1",
+        [subscriptionId],
+      )) === "unsubscribed" &&
+      Number(
+        await scalar(
+          db,
+          "select count(*) from fidensa_private.suppressions where canonical_email=$1 and scope='marketing_topic' and state='effective'",
+          [email],
+        ),
+      ) === 1,
+    "unsubscribe replay must be idempotent and topic-scoped",
+  );
+  invariant(
+    (await withRole(db, "service_role", () =>
+      scalar(
+        db,
+        "select fidensa_api.record_provider_event_v2($1,'suppression.removed',$2,$3,null,null,true)",
+        [
+          digest("governance-v2-late-relaxation"),
+          "2043-03-01T00:00:00Z",
+          email,
+        ],
+      ),
+    )) === "stale",
+    "late provider relaxation is recorded without release",
+  );
+  invariant(
+    Number(
+      await scalar(
+        db,
+        "select count(*) from fidensa_private.suppressions where canonical_email=$1 and state='effective'",
+        [email],
+      ),
+    ) === 1,
+    "provider relaxation must not release local suppression",
+  );
+
+  const privacyDigest = digest("governance-v2-privacy");
+  const privacyId = await withRole(db, "service_role", () =>
+    scalar(
+      db,
+      "select fidensa_api.create_privacy_request_v2('export',$1,$1,$2,$3,$4,'Synthetic request','Synthetic Applicant','Synthetic Organization','2043-01-01')",
+      [
+        "rights-v2@synthetic.invalid",
+        privacyDigest,
+        digest("privacy-ip-primary"),
+        digest("privacy-email-primary"),
+      ],
+    ),
+  );
+  invariant(privacyId, "bounded privacy v2 intake must create one case");
+  invariant(
+    (await withRole(db, "service_role", () =>
+      scalar(
+        db,
+        "select fidensa_api.create_privacy_request_v2('export',$1,$1,$2,$3,$4,'Synthetic replay','Synthetic Applicant','Synthetic Organization','2043-01-01')",
+        [
+          "rights-v2@synthetic.invalid",
+          privacyDigest,
+          digest("privacy-ip-replay"),
+          digest("privacy-email-primary"),
+        ],
+      ),
+    )) === null,
+    "privacy operation-key replay must be a generic no-op",
+  );
+
+  const privacyIpRate = digest("privacy-rate-ip-hour");
+  for (let attempt = 1; attempt <= 11; attempt += 1) {
+    await withRole(db, "service_role", () =>
+      scalar(
+        db,
+        "select fidensa_api.create_privacy_request_v2('access',$1,$1,$2,$3,$4,null,null,null,null)",
+        [
+          `privacy-ip-${attempt}@synthetic.invalid`,
+          digest(`privacy-ip-operation-${attempt}`),
+          privacyIpRate,
+          digest(`privacy-ip-email-${attempt}`),
+        ],
+      ),
+    );
+  }
+  invariant(
+    Number(
+      await scalar(
+        db,
+        "select count(*) from fidensa_private.abuse_events where event_class='privacy_intake' and ip_digest=$1 and result_class='allowed'",
+        [privacyIpRate],
+      ),
+    ) === 10 &&
+      Number(
+        await scalar(
+          db,
+          "select count(*) from fidensa_private.abuse_events where event_class='privacy_intake' and ip_digest=$1 and result_class='denied'",
+          [privacyIpRate],
+        ),
+      ) === 1,
+    "privacy intake must enforce the ten-per-hour IP limit through the database boundary",
+  );
+
+  const privacyEmailRate = digest("privacy-rate-email-hour");
+  for (let attempt = 1; attempt <= 4; attempt += 1) {
+    await withRole(db, "service_role", () =>
+      scalar(
+        db,
+        "select fidensa_api.create_privacy_request_v2($1,$2,$2,$3,$4,$5,null,null,null,null)",
+        [
+          ["access", "correction", "export", "deletion"][attempt - 1],
+          "privacy-email-hour@synthetic.invalid",
+          digest(`privacy-email-hour-operation-${attempt}`),
+          digest(`privacy-email-hour-ip-${attempt}`),
+          privacyEmailRate,
+        ],
+      ),
+    );
+  }
+  invariant(
+    Number(
+      await scalar(
+        db,
+        "select count(*) from fidensa_private.abuse_events where event_class='privacy_intake' and email_digest=$1 and result_class='denied'",
+        [privacyEmailRate],
+      ),
+    ) === 1,
+    "privacy intake must enforce the three-per-hour canonical-email limit",
+  );
+
+  const privacyIpDailyRate = digest("privacy-rate-ip-day");
+  for (let attempt = 1; attempt <= 31; attempt += 1) {
+    const minute = (attempt - 1) * 30;
+    const hour = String(Math.floor(minute / 60)).padStart(2, "0");
+    const minutePart = String(minute % 60).padStart(2, "0");
+    await configureTestAuthority(db, `2043-04-02T${hour}:${minutePart}:00Z`);
+    await withRole(db, "service_role", () =>
+      scalar(
+        db,
+        "select fidensa_api.create_privacy_request_v2('access',$1,$1,$2,$3,$4,null,null,null,null)",
+        [
+          `privacy-ip-day-${attempt}@synthetic.invalid`,
+          digest(`privacy-ip-day-operation-${attempt}`),
+          privacyIpDailyRate,
+          digest(`privacy-ip-day-email-${attempt}`),
+        ],
+      ),
+    );
+  }
+  invariant(
+    Number(
+      await scalar(
+        db,
+        "select count(*) from fidensa_private.abuse_events where event_class='privacy_intake' and ip_digest=$1 and result_class='denied'",
+        [privacyIpDailyRate],
+      ),
+    ) === 1,
+    "privacy intake must enforce the thirty-per-day IP limit",
+  );
+
+  const privacyEmailDailyRate = digest("privacy-rate-email-day");
+  for (let attempt = 1; attempt <= 6; attempt += 1) {
+    const hour = String((attempt - 1) * 2).padStart(2, "0");
+    await configureTestAuthority(db, `2043-04-03T${hour}:00:00Z`);
+    await withRole(db, "service_role", () =>
+      scalar(
+        db,
+        "select fidensa_api.create_privacy_request_v2('access',$1,$1,$2,$3,$4,null,null,null,null)",
+        [
+          "privacy-email-day@synthetic.invalid",
+          digest(`privacy-email-day-operation-${attempt}`),
+          digest(`privacy-email-day-ip-${attempt}`),
+          privacyEmailDailyRate,
+        ],
+      ),
+    );
+  }
+  invariant(
+    Number(
+      await scalar(
+        db,
+        "select count(*) from fidensa_private.abuse_events where event_class='privacy_intake' and email_digest=$1 and result_class='denied'",
+        [privacyEmailDailyRate],
+      ),
+    ) === 1,
+    "privacy intake must enforce the five-per-day canonical-email limit",
+  );
+  await expectRejected(
+    () =>
+      db.query(
+        "select fidensa_api.record_manual_communication($1,'interview','interview-draft-v1','intended',null)",
+        [applicationId],
+      ),
+    "unapproved manual template",
+  );
+  await db.query(
+    `update fidensa_private.manual_message_templates
+        set state='approved', approved_by='scott_bishop',
+            approved_at=fidensa_private.authoritative_now()
+      where type='waitlist' and version='waitlist-draft-v1'`,
+  );
+  const manualCommunicationId = await scalar(
+    db,
+    "select fidensa_api.record_manual_communication($1,'waitlist','waitlist-draft-v1','intended','Synthetic operator note')",
+    [applicationId],
+  );
+  invariant(
+    await scalar(
+      db,
+      `select type='waitlist' and class='manual' and actor='scott_bishop'
+              and template_version='waitlist-draft-v1'
+              and note='Synthetic operator note'
+              and occurred_at=fidensa_private.authoritative_now()
+         from fidensa_private.communications where id=$1`,
+      [manualCommunicationId],
+    ),
+    "an exactly approved manual template must record actor, type, time, version, and optional note",
+  );
+
+  const deletionLabel = "rights-delete-active-consent";
+  const deletionEmail = `${deletionLabel}@synthetic.invalid`;
+  const deletionApplication = await submit(db, {
+    label: deletionLabel,
+    email: deletionEmail,
+    now: "2044-01-01T00:00:00Z",
+    marketing: true,
+  });
+  await verify(db, deletionLabel, "2044-01-01T00:01:00Z");
+  const deletionRequest = await withRole(db, "service_role", () =>
+    scalar(
+      db,
+      "select fidensa_api.create_privacy_request_v2('deletion',$1,$1,$2,$3,$4,'Synthetic deletion',null,null,null)",
+      [
+        deletionEmail,
+        digest("rights-delete-active-consent-request"),
+        digest("rights-delete-ip"),
+        digest("rights-delete-email"),
+      ],
+    ),
+  );
+  await db.query(
+    "select fidensa_api.record_privacy_confirmation_intent($1,1,array['application'],'scott_bishop')",
+    [deletionRequest],
+  );
+  const deletionConfirmation = await withRole(db, "service_role", () =>
+    scalar(db, "select fidensa_api.claim_privacy_confirmation_intent()"),
+  );
+  const deletionCredentialDigest = digest("privacy-delete-confirmation");
+  invariant(
+    deletionConfirmation?.recipient === deletionEmail,
+    "manual privacy intent must target the address already on the application record",
+  );
+  await withRole(db, "service_role", () =>
+    db.query("select fidensa_api.issue_privacy_confirmation($1,$2)", [
+      deletionConfirmation.intentId,
+      deletionCredentialDigest,
+    ]),
+  );
+  invariant(
+    (await withRole(db, "service_role", () =>
+      scalar(db, "select fidensa_api.consume_privacy_confirmation($1)", [
+        deletionCredentialDigest,
+      ]),
+    )) === true &&
+      (await withRole(db, "service_role", () =>
+        scalar(db, "select fidensa_api.consume_privacy_confirmation($1)", [
+          deletionCredentialDigest,
+        ]),
+      )) === false,
+    "privacy confirmation must be short-lived, server-consumed, and single-use",
+  );
+  await db.query(
+    "select fidensa_api.transition_privacy_request($1,2,'under_review',array['application'],'Synthetic review','scott_bishop')",
+    [deletionRequest],
+  );
+  await db.query(
+    "select fidensa_api.fulfill_privacy_deletion($1,3,'Synthetic verified deletion')",
+    [deletionRequest],
+  );
+  invariant(
+    Number(
+      await scalar(
+        db,
+        "select count(*) from fidensa_private.applications where id=$1",
+        [deletionApplication],
+      ),
+    ) === 0 &&
+      Number(
+        await scalar(
+          db,
+          "select count(*) from fidensa_private.subscriptions where canonical_email=$1 and state='active' and application_id is null",
+          [deletionEmail],
+        ),
+      ) === 1,
+    "application-only verified deletion must remove applicant domains and preserve only the separate active subscription",
+  );
+
+  for (let index = 0; index < 25; index += 1) {
+    const priorSuppression = await withRole(db, "service_role", () =>
+      scalar(db, "select fidensa_api.claim_global_suppression_sync()"),
+    );
+    if (!priorSuppression) break;
+    await withRole(db, "service_role", () =>
+      db.query(
+        "select fidensa_api.record_global_suppression_sync_result($1,'applied')",
+        [priorSuppression.operationId],
+      ),
+    );
+  }
+
+  const subscriptionDeleteLabel = "rights-delete-subscription";
+  const subscriptionDeleteEmail = `${subscriptionDeleteLabel}@synthetic.invalid`;
+  const subscriptionDeleteApplication = await submit(db, {
+    label: subscriptionDeleteLabel,
+    email: subscriptionDeleteEmail,
+    now: "2044-01-02T00:00:00Z",
+    marketing: true,
+  });
+  await verify(db, subscriptionDeleteLabel, "2044-01-02T00:01:00Z");
+  const subscriptionDeleteId = await scalar(
+    db,
+    "select id from fidensa_private.subscriptions where application_id=$1",
+    [subscriptionDeleteApplication],
+  );
+  const subscriptionDeleteRequest = await withRole(db, "service_role", () =>
+    scalar(
+      db,
+      "select fidensa_api.create_privacy_request_v2('deletion',$1,$1,$2,$3,$4,'Synthetic subscription deletion',null,null,null)",
+      [
+        subscriptionDeleteEmail,
+        digest("rights-delete-subscription-request"),
+        digest("rights-delete-subscription-ip"),
+        digest("rights-delete-subscription-email"),
+      ],
+    ),
+  );
+  await db.query(
+    "select fidensa_api.record_privacy_confirmation_intent($1,1,array['subscription'],'scott_bishop')",
+    [subscriptionDeleteRequest],
+  );
+  const subscriptionDeleteConfirmation = await withRole(
+    db,
+    "service_role",
+    () => scalar(db, "select fidensa_api.claim_privacy_confirmation_intent()"),
+  );
+  const subscriptionDeleteCredential = digest(
+    "privacy-subscription-delete-confirmation",
+  );
+  await withRole(db, "service_role", () =>
+    db.query("select fidensa_api.issue_privacy_confirmation($1,$2)", [
+      subscriptionDeleteConfirmation.intentId,
+      subscriptionDeleteCredential,
+    ]),
+  );
+  await withRole(db, "service_role", () =>
+    db.query("select fidensa_api.consume_privacy_confirmation($1)", [
+      subscriptionDeleteCredential,
+    ]),
+  );
+  await db.query(
+    "select fidensa_api.transition_privacy_request($1,2,'under_review',array['subscription'],'Synthetic subscription review','scott_bishop')",
+    [subscriptionDeleteRequest],
+  );
+  await db.query(
+    "select fidensa_api.fulfill_privacy_deletion($1,3,'Synthetic verified subscription deletion')",
+    [subscriptionDeleteRequest],
+  );
+  invariant(
+    Number(
+      await scalar(
+        db,
+        "select count(*) from fidensa_private.applications where id=$1",
+        [subscriptionDeleteApplication],
+      ),
+    ) === 1 &&
+      Number(
+        await scalar(
+          db,
+          "select count(*) from fidensa_private.subscriptions where id=$1",
+          [subscriptionDeleteId],
+        ),
+      ) === 0 &&
+      Number(
+        await scalar(
+          db,
+          "select count(*) from fidensa_private.consent_history where subscription_id=$1",
+          [subscriptionDeleteId],
+        ),
+      ) === 0 &&
+      Number(
+        await scalar(
+          db,
+          "select count(*) from fidensa_private.consent_acts where subscription_id=$1",
+          [subscriptionDeleteId],
+        ),
+      ) === 0,
+    "subscription-scoped deletion must preserve the application while removing subscription consent rows",
+  );
+  invariant(
+    (await scalar(
+      db,
+      "select state::text from fidensa_private.privacy_requests where id=$1",
+      [subscriptionDeleteRequest],
+    )) === "under_review" &&
+      (await scalar(
+        db,
+        `select outcome='partial' and operation='deletion'
+           from fidensa_private.privacy_operation_audit
+          where privacy_request_id=$1
+          order by occurred_at desc, id desc limit 1`,
+        [subscriptionDeleteRequest],
+      )),
+    "partial subscription cleanup must directly record a partial audit and keep the request under review before provider reconciliation",
+  );
+  const topicSuppressionClaim = await withRole(db, "service_role", () =>
+    scalar(db, "select fidensa_api.claim_global_suppression_sync()"),
+  );
+  invariant(
+    topicSuppressionClaim?.canonicalEmail === subscriptionDeleteEmail &&
+      topicSuppressionClaim?.scope === "marketing_topic",
+    "subscription deletion must retain only a topic restriction and queue provider reconciliation",
+  );
+  await withRole(db, "service_role", () =>
+    db.query(
+      "select fidensa_api.record_global_suppression_sync_result($1,'applied')",
+      [topicSuppressionClaim.operationId],
+    ),
+  );
+  await db.query(
+    "select fidensa_api.fulfill_privacy_deletion($1,3,'Synthetic verified subscription deletion')",
+    [subscriptionDeleteRequest],
+  );
+  invariant(
+    (await scalar(
+      db,
+      "select state::text from fidensa_private.privacy_requests where id=$1",
+      [subscriptionDeleteRequest],
+    )) === "fulfilled" &&
+      Number(
+        await scalar(
+          db,
+          "select count(*) from fidensa_private.suppressions where canonical_email=$1 and scope='marketing_topic' and state='effective'",
+          [subscriptionDeleteEmail],
+        ),
+      ) === 1,
+    "provider-reconciled subscription deletion must finish with one minimal topic suppression",
+  );
+
+  const allScopeLabel = "rights-delete-all-current";
+  const allScopeEmail = "rights-delete-all@synthetic.invalid";
+  const transferredApplication = await submit(db, {
+    label: "rights-delete-all-transferred",
+    email: allScopeEmail,
+    now: "2044-01-03T00:00:00Z",
+  });
+  await verify(db, "rights-delete-all-transferred", "2044-01-03T00:01:00Z");
+  await db.query(
+    "select fidensa_api.transition_reviewer_status($1,1,'accepted','Synthetic accepted transfer','scott_bishop')",
+    [transferredApplication],
+  );
+  await configureTestAuthority(db, "2044-01-03T00:02:00Z");
+  await db.query(
+    "select fidensa_api.transfer_accepted_application($1,'accepted-application-transfer-policy-v1:synthetic','scott_bishop')",
+    [transferredApplication],
+  );
+  const allScopeApplication = await submit(db, {
+    label: allScopeLabel,
+    email: allScopeEmail,
+    now: "2044-01-03T00:03:00Z",
+    marketing: true,
+  });
+  await verify(db, allScopeLabel, "2044-01-03T00:04:00Z");
+  invariant(
+    Number(
+      await scalar(
+        db,
+        "select count(*) from fidensa_private.applications where canonical_email=$1",
+        [allScopeEmail],
+      ),
+    ) === 2,
+    "all-scope fixture must contain multiple matching application lifecycles",
+  );
+  const allScopeRequest = await withRole(db, "service_role", () =>
+    scalar(
+      db,
+      "select fidensa_api.create_privacy_request_v2('deletion',$1,$1,$2,$3,$4,'Synthetic all-scope deletion',null,null,null)",
+      [
+        allScopeEmail,
+        digest("rights-delete-all-request"),
+        digest("rights-delete-all-ip"),
+        digest("rights-delete-all-email"),
+      ],
+    ),
+  );
+  await confirmPrivacyRequest(db, allScopeRequest, ["all"], "all-scope");
+  await db.query(
+    "select fidensa_api.fulfill_privacy_deletion($1,3,'Synthetic verified all-scope deletion')",
+    [allScopeRequest],
+  );
+  invariant(
+    Number(
+      await scalar(
+        db,
+        "select count(*) from fidensa_private.applications where id=$1",
+        [allScopeApplication],
+      ),
+    ) === 0 &&
+      Number(
+        await scalar(
+          db,
+          "select count(*) from fidensa_private.applications where id=$1 and lifecycle='transferred'",
+          [transferredApplication],
+        ),
+      ) === 1 &&
+      Number(
+        await scalar(
+          db,
+          "select count(*) from fidensa_private.subscriptions where canonical_email=$1",
+          [allScopeEmail],
+        ),
+      ) === 0,
+    "all-scope deletion must remove every applicable current application and subscription while preserving separately governed transferred data",
+  );
+  invariant(
+    (await scalar(
+      db,
+      "select state::text from fidensa_private.privacy_requests where id=$1",
+      [allScopeRequest],
+    )) === "under_review" &&
+      (await scalar(
+        db,
+        `select outcome='partial' and operation='deletion'
+           from fidensa_private.privacy_operation_audit
+          where privacy_request_id=$1
+          order by occurred_at desc, id desc limit 1`,
+        [allScopeRequest],
+      )),
+    "partial all-scope cleanup must directly record a partial audit and keep the request under review before provider reconciliation",
+  );
+  const allScopeSuppressionClaim = await withRole(db, "service_role", () =>
+    scalar(db, "select fidensa_api.claim_global_suppression_sync()"),
+  );
+  invariant(
+    allScopeSuppressionClaim?.canonicalEmail === allScopeEmail &&
+      allScopeSuppressionClaim?.scope === "marketing_topic",
+    "all-scope deletion must queue its minimum topic restriction",
+  );
+  await withRole(db, "service_role", () =>
+    db.query(
+      "select fidensa_api.record_global_suppression_sync_result($1,'applied')",
+      [allScopeSuppressionClaim.operationId],
+    ),
+  );
+  await db.query(
+    "select fidensa_api.fulfill_privacy_deletion($1,3,'Synthetic verified all-scope deletion')",
+    [allScopeRequest],
+  );
+  invariant(
+    (await scalar(
+      db,
+      "select state::text from fidensa_private.privacy_requests where id=$1",
+      [allScopeRequest],
+    )) === "fulfilled",
+    "all-scope deletion must remain partial until provider reconciliation completes",
+  );
+
+  const correctionLabel = "rights-correction";
+  const correctionEmail = `${correctionLabel}@synthetic.invalid`;
+  await submit(db, {
+    label: correctionLabel,
+    email: correctionEmail,
+    now: "2044-02-01T00:00:00Z",
+  });
+  await verify(db, correctionLabel, "2044-02-01T00:01:00Z");
+  const correctionRequest = await withRole(db, "service_role", () =>
+    scalar(
+      db,
+      "select fidensa_api.create_privacy_request_v2('correction',$1,$1,$2,$3,$4,'Synthetic correction',null,null,null)",
+      [
+        correctionEmail,
+        digest("rights-correction-request"),
+        digest("rights-correction-ip"),
+        digest("rights-correction-email"),
+      ],
+    ),
+  );
+  await db.query(
+    "select fidensa_api.record_privacy_confirmation_intent($1,1,array['application'],'scott_bishop')",
+    [correctionRequest],
+  );
+  const correctionConfirmation = await withRole(db, "service_role", () =>
+    scalar(db, "select fidensa_api.claim_privacy_confirmation_intent()"),
+  );
+  const correctionCredentialDigest = digest("privacy-correction-confirmation");
+  await withRole(db, "service_role", () =>
+    db.query("select fidensa_api.issue_privacy_confirmation($1,$2)", [
+      correctionConfirmation.intentId,
+      correctionCredentialDigest,
+    ]),
+  );
+  await withRole(db, "service_role", () =>
+    db.query("select fidensa_api.consume_privacy_confirmation($1)", [
+      correctionCredentialDigest,
+    ]),
+  );
+  await db.query(
+    "select fidensa_api.transition_privacy_request($1,2,'under_review',array['application'],'Synthetic review','scott_bishop')",
+    [correctionRequest],
+  );
+  await db.query(
+    "select fidensa_api.fulfill_privacy_correction($1,3,'Corrected Synthetic Applicant',$2,'Corrected Synthetic Organization','Synthetic verified correction')",
+    [correctionRequest, correctionEmail],
+  );
+  invariant(
+    await scalar(
+      db,
+      "select applicant_name='Corrected Synthetic Applicant' and organization='Corrected Synthetic Organization' from fidensa_private.applications where canonical_email=$1",
+      [correctionEmail],
+    ),
+    "verified correction must change only the bounded application fields",
+  );
+
+  const exportRequest = await withRole(db, "service_role", () =>
+    scalar(
+      db,
+      "select fidensa_api.create_privacy_request_v2('export',$1,$1,$2,$3,$4,'Synthetic export','Corrected Synthetic Applicant','Corrected Synthetic Organization','2044-02-01')",
+      [
+        correctionEmail,
+        digest("rights-export-request"),
+        digest("rights-export-ip"),
+        digest("rights-export-email"),
+      ],
+    ),
+  );
+  await db.query(
+    "select fidensa_api.record_privacy_confirmation_intent($1,1,array['application'],'scott_bishop')",
+    [exportRequest],
+  );
+  const exportConfirmation = await withRole(db, "service_role", () =>
+    scalar(db, "select fidensa_api.claim_privacy_confirmation_intent()"),
+  );
+  const exportCredentialDigest = digest("privacy-export-confirmation");
+  await withRole(db, "service_role", () =>
+    db.query("select fidensa_api.issue_privacy_confirmation($1,$2)", [
+      exportConfirmation.intentId,
+      exportCredentialDigest,
+    ]),
+  );
+  invariant(
+    (await withRole(db, "service_role", () =>
+      scalar(db, "select fidensa_api.consume_privacy_confirmation($1)", [
+        exportCredentialDigest,
+      ]),
+    )) === true,
+    "matching existing details plus mailbox confirmation must authorize export scope",
+  );
+  await db.query(
+    "select fidensa_api.transition_privacy_request($1,2,'under_review',array['application'],'Synthetic review','scott_bishop')",
+    [exportRequest],
+  );
+  const exported = await scalar(
+    db,
+    "select fidensa_api.fulfill_privacy_read($1,3,'Synthetic verified export')",
+    [exportRequest],
+  );
+  invariant(
+    exported?.requestType === "export" &&
+      exported?.applications?.length === 1 &&
+      exported.applications[0]?.applicant_name ===
+        "Corrected Synthetic Applicant" &&
+      Array.isArray(exported.applications[0]?.privacyAcknowledgements) &&
+      Array.isArray(exported.applications[0]?.statusHistory) &&
+      Array.isArray(exported.applications[0]?.scoreSets) &&
+      Array.isArray(exported.applications[0]?.communications) &&
+      Array.isArray(exported.applications[0]?.consentActs) &&
+      !Object.hasOwn(exported.applications[0], "operation_digest") &&
+      Number(
+        await scalar(
+          db,
+          "select count(*) from fidensa_private.privacy_operation_audit where privacy_request_id in ($1,$2,$3) and outcome='completed'",
+          [deletionRequest, correctionRequest, exportRequest],
+        ),
+      ) === 3,
+    "access/export, correction, and deletion must be scope-bounded and auditable",
+  );
+
+  await configureTestAuthority(db, "2044-02-02T00:00:00Z");
+  const exceptionalCases = [
+    ["deletion", "inaccessible_email"],
+    ["access", "fraud"],
+    ["export", "representative"],
+  ];
+  const exceptionalProofIds = [];
+  for (const [requestType, evidenceClass] of exceptionalCases) {
+    const exceptionalEmail = `privacy-${evidenceClass}@synthetic.invalid`;
+    const requestId = await withRole(db, "service_role", () =>
+      scalar(
+        db,
+        "select fidensa_api.create_privacy_request_v2($1,$2,$2,$3,$4,$5,'Synthetic exceptional request',null,null,null)",
+        [
+          requestType,
+          exceptionalEmail,
+          digest(`exceptional-${evidenceClass}-operation`),
+          digest(`exceptional-${evidenceClass}-ip`),
+          digest(`exceptional-${evidenceClass}-email`),
+        ],
+      ),
+    );
+    await expectRejected(
+      () =>
+        db.query(
+          "select fidensa_api.verify_privacy_request_identity($1,1,array['application'],false,null)",
+          [requestId],
+        ),
+      `${evidenceClass} verification without exceptional proof`,
+    );
+    const proofId = await scalar(
+      db,
+      `insert into fidensa_private.identity_proofs
+         (privacy_request_id,proof_reference_digest,evidence_class,result)
+       values ($1,$2,$3,'accepted') returning id`,
+      [requestId, digest(`exceptional-${evidenceClass}-proof`), evidenceClass],
+    );
+    exceptionalProofIds.push(proofId);
+    await db.query(
+      "select fidensa_api.verify_privacy_request_identity($1,1,array['application'],false,$2)",
+      [requestId, proofId],
+    );
+    invariant(
+      await scalar(
+        db,
+        "select state='verified' and purpose_ended_at is not null and deletion_deadline=purpose_ended_at+interval '24 hours' from fidensa_private.privacy_requests request join fidensa_private.identity_proofs proof on proof.privacy_request_id=request.id where proof.id=$1",
+        [proofId],
+      ),
+      `${evidenceClass} proof must be exceptional, purpose-ended, and promptly expiring`,
+    );
+  }
+  await configureTestAuthority(db, "2044-02-03T00:04:00Z");
+  await withRole(db, "fidensa_job", () =>
+    db.query("select fidensa_api.run_current_retention()"),
+  );
+  invariant(
+    Number(
+      await scalar(
+        db,
+        "select count(*) from fidensa_private.identity_proofs where id=any($1::uuid[])",
+        [exceptionalProofIds],
+      ),
+    ) === 0,
+    "purpose-ended inaccessible-email, fraud, and representative proof must expire after 24 hours",
+  );
+  console.log(
+    "PASS quarterly consent review, provider reconciliation, scoped suppression, and audited rights operations",
+  );
+}
+
+async function testFirstActivationForwardUpgrade() {
+  const db = new PGlite();
+  try {
+    await bootstrapSupabaseRoleSurface(db);
+    const migrations = await forwardMigrations();
+    const guardIndex = migrations.indexOf(firstActivationGuardMigration);
+    invariant(
+      guardIndex > 0 && guardIndex === migrations.length - 1,
+      "first-activation guard must be the final forward migration",
+    );
+    await applyForwardAsStudioOwner(db, migrations.slice(0, guardIndex));
+    await installTestFixturesAsStudioOwner(db);
+    await configureTestAuthority(db, "2045-01-01T00:00:00Z");
+
+    const label = "forward-upgrade-partial-activation";
+    const email = `${label}@synthetic.invalid`;
+    const applicationId = await submit(db, {
+      label,
+      email,
+      now: "2045-01-01T00:00:00Z",
+      marketing: true,
+    });
+    await verify(db, label, "2045-01-01T00:01:00Z");
+    const subscriptionId = await scalar(
+      db,
+      "select id from fidensa_private.subscriptions where application_id=$1",
+      [applicationId],
+    );
+    const operation = await withRole(db, "service_role", () =>
+      scalar(db, "select fidensa_api.claim_subscription_sync()"),
+    );
+
+    await applyOneForwardAsStudioOwner(db, firstActivationGuardMigration);
+    await withRole(db, "service_role", () =>
+      db.query(
+        "select fidensa_api.record_subscription_sync_result($1,'applied',true,false,false)",
+        [operation.operationId],
+      ),
+    );
+    invariant(
+      (await scalar(
+        db,
+        "select state::text from fidensa_private.subscription_sync_operations where operation_id=$1",
+        [operation.operationId],
+      )) === "needs_reconciliation" &&
+        (await scalar(
+          db,
+          "select state::text from fidensa_private.subscriptions where id=$1",
+          [subscriptionId],
+        )) === "active" &&
+        Number(
+          await scalar(
+            db,
+            "select count(*) from fidensa_private.suppressions where canonical_email=$1 and state='effective'",
+            [email],
+          ),
+        ) === 0,
+      "forward upgrade must protect an already-claimed partial first activation",
+    );
+    console.log(
+      "PASS forward upgrade preserves retryable partial first activation",
+    );
+  } finally {
+    await db.close();
+  }
+}
+
+async function testGlobalSuppressionDeliveryForwardUpgrade() {
+  const db = new PGlite();
+  try {
+    await bootstrapSupabaseRoleSurface(db);
+    const migrations = await forwardMigrations();
+    const guardIndex = migrations.indexOf(
+      globalSuppressionDeliveryGuardMigration,
+    );
+    invariant(
+      guardIndex > 0,
+      "global-suppression delivery guard must follow the consent migration",
+    );
+    await applyForwardAsStudioOwner(db, migrations.slice(0, guardIndex));
+    await installTestFixturesAsStudioOwner(db);
+    await configureTestAuthority(db, "2045-02-01T00:00:00Z");
+
+    const label = "forward-upgrade-global-suppression";
+    const email = `${label}@synthetic.invalid`;
+    await submit(db, {
+      label,
+      email,
+      now: "2045-02-01T00:00:00Z",
+      marketing: false,
+    });
+    await db.query(
+      "select fidensa_api.record_complete_do_not_contact($1,$2,'scott_bishop')",
+      [email, "synthetic-forward-upgrade"],
+    );
+
+    await applyOneForwardAsStudioOwner(
+      db,
+      globalSuppressionDeliveryGuardMigration,
+    );
+    invariant(
+      (await withRole(db, "service_role", () =>
+        scalar(db, "select fidensa_api.claim_application_message(null)"),
+      )) === null,
+      "forward upgrade must stop an already-queued applicant message under global suppression",
+    );
+    console.log(
+      "PASS forward upgrade enforces global suppression on queued application mail",
+    );
+  } finally {
+    await db.close();
+  }
+}
+
 async function testRecoveryAndRebuild(db, initialTableCount) {
   await db.exec("set role fidensa_studio_owner");
   try {
@@ -4008,6 +5316,8 @@ async function testRecoveryAndRebuild(db, initialTableCount) {
 }
 
 async function main() {
+  await testGlobalSuppressionDeliveryForwardUpgrade();
+  await testFirstActivationForwardUpgrade();
   const db = new PGlite();
   try {
     await bootstrapSupabaseRoleSurface(db);
@@ -4035,6 +5345,7 @@ async function main() {
     await testStudioOwnerBypassDenial(db);
     await testRetention(db);
     await testProviderAndPrivacyDomains(db);
+    await testConsentPrivacyOperations(db);
     await testExerciseControl(db);
     await testRecoveryAndRebuild(db, initialTableCount);
     console.log("DATABASE CONTRACT PASS");

@@ -35,10 +35,13 @@ function productionEnvironment(
     SERVER_MESSAGE_ACCESS_CREDENTIAL: credential("message"),
     SERVER_TOKEN_DERIVATION_MATERIAL: credential("token"),
     SERVER_RECONCILIATION_CREDENTIAL: credential("reconciliation"),
+    SERVER_MARKETING_RECONCILE_CREDENTIAL: credential("marketing"),
+    SERVER_RESEND_WEBHOOK_SECRET: `whsec_${"x".repeat(40)}`,
     SERVER_DATA_API_ORIGIN: "https://project.supabase.co",
     SERVER_REVIEWER_RECORD_BASE_URL:
       "https://supabase.com/dashboard/project/project/editor/records",
     SERVER_REVIEWER_NOTIFICATION_RECIPIENT: "reviewer@fidensa.example",
+    SERVER_RESEND_MARKETING_TOPIC_ID: "00000000-0000-4000-8000-000000000001",
   };
 }
 

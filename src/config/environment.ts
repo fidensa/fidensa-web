@@ -29,11 +29,14 @@ export type RuntimeConfig = BuildConfig &
       messageAccess: string;
       tokenMaterial: string;
       reconciliationAccess: string;
+      marketingReconcileAccess: string;
+      resendWebhookSecret: string;
     }>;
     serverServices?: Readonly<{
       dataApiOrigin: string;
       reviewerRecordBaseUrl: string;
       reviewerNotificationRecipient: string;
+      marketingTopicId: string;
     }>;
   }>;
 
@@ -322,6 +325,8 @@ export function validateRuntimeEnvironment(
     "SERVER_MESSAGE_ACCESS_CREDENTIAL",
     "SERVER_TOKEN_DERIVATION_MATERIAL",
     "SERVER_RECONCILIATION_CREDENTIAL",
+    "SERVER_MARKETING_RECONCILE_CREDENTIAL",
+    "SERVER_RESEND_WEBHOOK_SECRET",
   ] as const;
 
   if (!isProductionClass) {
@@ -355,6 +360,16 @@ export function validateRuntimeEnvironment(
       credentialNames[3],
       "reconciliation entry credential",
     ),
+    marketingReconcileAccess: readServerCredential(
+      input,
+      credentialNames[4],
+      "marketing reconciliation credential",
+    ),
+    resendWebhookSecret: readServerCredential(
+      input,
+      credentialNames[5],
+      "Resend webhook signing secret",
+    ),
   };
 
   const reviewerNotificationRecipient = readRequired(
@@ -380,6 +395,11 @@ export function validateRuntimeEnvironment(
       "reviewer record location",
     ),
     reviewerNotificationRecipient,
+    marketingTopicId: readRequired(
+      input,
+      "SERVER_RESEND_MARKETING_TOPIC_ID",
+      "Resend marketing topic identity",
+    ),
   };
 
   return { ...build, serverCredentials, serverServices };
