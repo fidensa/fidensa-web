@@ -34,6 +34,11 @@ function productionEnvironment(
     SERVER_DATA_ACCESS_CREDENTIAL: credential("data"),
     SERVER_MESSAGE_ACCESS_CREDENTIAL: credential("message"),
     SERVER_TOKEN_DERIVATION_MATERIAL: credential("token"),
+    SERVER_RECONCILIATION_CREDENTIAL: credential("reconciliation"),
+    SERVER_DATA_API_ORIGIN: "https://project.supabase.co",
+    SERVER_REVIEWER_RECORD_BASE_URL:
+      "https://supabase.com/dashboard/project/project/editor/records",
+    SERVER_REVIEWER_NOTIFICATION_RECIPIENT: "reviewer@fidensa.example",
   };
 }
 

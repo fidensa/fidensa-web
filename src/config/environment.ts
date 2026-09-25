@@ -28,6 +28,12 @@ export type RuntimeConfig = BuildConfig &
       dataAccess: string;
       messageAccess: string;
       tokenMaterial: string;
+      reconciliationAccess: string;
+    }>;
+    serverServices?: Readonly<{
+      dataApiOrigin: string;
+      reviewerRecordBaseUrl: string;
+      reviewerNotificationRecipient: string;
     }>;
   }>;
 
@@ -276,6 +282,33 @@ function readServerCredential(
   return value;
 }
 
+function readServerUrl(
+  input: EnvironmentInput,
+  name: string,
+  category: string,
+): string {
+  const value = readRequired(input, name, category);
+  let url: URL;
+  try {
+    url = new URL(value);
+  } catch {
+    throw new EnvironmentValidationError(category, "the URL is malformed");
+  }
+  if (
+    url.protocol !== "https:" ||
+    url.username ||
+    url.password ||
+    url.hash ||
+    url.search
+  ) {
+    throw new EnvironmentValidationError(
+      category,
+      "the URL must be credential-free HTTPS without a query or fragment",
+    );
+  }
+  return value.replace(/\/$/u, "");
+}
+
 export function validateRuntimeEnvironment(
   input: EnvironmentInput,
 ): RuntimeConfig {
@@ -288,6 +321,7 @@ export function validateRuntimeEnvironment(
     "SERVER_DATA_ACCESS_CREDENTIAL",
     "SERVER_MESSAGE_ACCESS_CREDENTIAL",
     "SERVER_TOKEN_DERIVATION_MATERIAL",
+    "SERVER_RECONCILIATION_CREDENTIAL",
   ] as const;
 
   if (!isProductionClass) {
@@ -316,7 +350,37 @@ export function validateRuntimeEnvironment(
       credentialNames[2],
       "token derivation material",
     ),
+    reconciliationAccess: readServerCredential(
+      input,
+      credentialNames[3],
+      "reconciliation entry credential",
+    ),
   };
 
-  return { ...build, serverCredentials };
+  const reviewerNotificationRecipient = readRequired(
+    input,
+    "SERVER_REVIEWER_NOTIFICATION_RECIPIENT",
+    "reviewer notification recipient",
+  ).toLowerCase();
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/u.test(reviewerNotificationRecipient)) {
+    throw new EnvironmentValidationError(
+      "reviewer notification recipient",
+      "the address is malformed",
+    );
+  }
+  const serverServices = {
+    dataApiOrigin: readServerUrl(
+      input,
+      "SERVER_DATA_API_ORIGIN",
+      "data API origin",
+    ),
+    reviewerRecordBaseUrl: readServerUrl(
+      input,
+      "SERVER_REVIEWER_RECORD_BASE_URL",
+      "reviewer record location",
+    ),
+    reviewerNotificationRecipient,
+  };
+
+  return { ...build, serverCredentials, serverServices };
 }

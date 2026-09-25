@@ -6,6 +6,6 @@ export default defineConfig({
       enabled: false,
     },
     environment: "node",
-    include: ["tests/**/*.test.ts"],
+    include: ["tests/**/*.test.{ts,tsx}"],
   },
 });

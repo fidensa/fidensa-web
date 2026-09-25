@@ -1,7 +1,10 @@
 import { spawn } from "node:child_process";
+import { rm } from "node:fs/promises";
+import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { assertSupportedToolchain } from "./toolchain.mjs";
+import { runtimeEnvironment } from "./runtime-environment.mjs";
 
 const command = process.argv[2];
 if (!new Set(["build", "dev", "start"]).has(command)) {
@@ -16,7 +19,7 @@ if (!npmVersion) {
 }
 assertSupportedToolchain(process.versions.node, npmVersion);
 
-const environment = { ...process.env };
+const environment = runtimeEnvironment();
 if (!environment.APP_ENV && !environment.VERCEL_ENV) {
   const development = command === "dev";
   environment.APP_ENV = development ? "local" : "test";
@@ -48,7 +51,13 @@ const child = spawn(
   },
 );
 
-child.on("exit", (code, signal) => {
+child.on("exit", async (code, signal) => {
+  if (command === "build") {
+    await rm(path.join(process.cwd(), ".next", "cache"), {
+      recursive: true,
+      force: true,
+    });
+  }
   if (signal) process.kill(process.pid, signal);
   process.exitCode = code ?? 1;
 });

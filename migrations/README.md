@@ -80,6 +80,19 @@ isolated harness from `tests/fixtures/application-database-fixtures.sql`; it is
 not a production migration. The harness never connects to a remote or
 production database.
 
+The final application-delivery migration adds server-only wrapper operations
+that create and claim durable message-outbox rows after a committed intake,
+verification, or resend. Verification credentials exist only transiently in the sending worker;
+the wrapper returns only stable delivery identities and the address already
+stored with the application. Provider outcomes append to communication history.
+When a provider message identity exists, reconciliation retrieves that exact
+message; otherwise identical-key retries stop after 12 hours or three attempts,
+whichever comes first, and become owner-visible `needs_reconciliation` work.
+The server-only reconciliation route is intended for the `10 * * * *` UTC
+schedule configured by the deployment task. The migration also records
+honeypot denials as 48-hour abuse events. It grants no table, private-schema,
+or queue access.
+
 Current Supabase Cron and database-backup documentation was rechecked on
 2026-09-24. Cron uses `pg_cron`, can invoke database functions directly, and
 records provider run history in `cron.job_run_details`; the migration bounds

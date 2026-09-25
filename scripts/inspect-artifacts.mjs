@@ -44,6 +44,14 @@ async function scanFiles(files, forbidden, label) {
 }
 
 const sourceFiles = await filesBelow(root);
+if (
+  await readdir(path.join(root, ".next", "cache")).then(
+    () => true,
+    () => false,
+  )
+) {
+  throw new Error("Generated build cache must be absent from the work root.");
+}
 const clientFiles = await filesBelow(path.join(root, ".next", "static")).then(
   (files) => files.map((file) => path.join(".next", "static", file)),
 );
@@ -109,6 +117,7 @@ const approvedMigrationFiles = new Set([
   "migrations/20260924224500_authoritative_time_and_health_retry_guards.sql",
   "migrations/20260924225000_lifecycle_and_retention_anchor_guards.sql",
   "migrations/20260924225500_schedule_and_truncate_guards.sql",
+  "migrations/20260925100000_application_delivery_intents.sql",
   "migrations/recovery/20260924223000_drop_protected_application_database.sql",
 ]);
 if (

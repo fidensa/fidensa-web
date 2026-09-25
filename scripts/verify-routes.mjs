@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { readFile, readdir } from "node:fs/promises";
+import { readFile, readdir, rm } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -7,6 +7,7 @@ import {
   assertSecurityBaselineHeaders,
   assertSecurityHeaders,
 } from "../src/security/header-oracle.ts";
+import { runtimeEnvironment } from "./runtime-environment.mjs";
 
 const port = Number(process.env.FOUNDATION_TEST_PORT ?? "43173");
 const baseUrl = `http://127.0.0.1:${port}`;
@@ -84,13 +85,12 @@ const server = spawn(
   process.execPath,
   [nextBinary, "start", "-H", "127.0.0.1", "-p", String(port)],
   {
-    env: {
-      ...process.env,
+    env: runtimeEnvironment({
       APP_ENV: "test",
       NEXT_PUBLIC_SITE_ORIGIN: baseUrl,
       PROVIDER_PROFILE: "deterministic",
       DELIVERY_PROFILE: "capture",
-    },
+    }),
     stdio: ["ignore", "pipe", "pipe"],
   },
 );
@@ -196,13 +196,86 @@ try {
     throw new Error("Evidence fallback exposed gated wording.");
   }
 
+  for (const pathName of [
+    "/api/applications",
+    "/api/applications/resend",
+    "/api/applications/verify",
+    "/api/internal/application-messages/reconcile",
+  ]) {
+    const get = await fetch(`${baseUrl}${pathName}`, { redirect: "manual" });
+    if (get.status !== 405 || get.headers.get("allow") !== "POST") {
+      throw new Error(`GET ${pathName} did not remain POST-only.`);
+    }
+  }
+
+  const unauthorizedReconciliation = await fetch(
+    `${baseUrl}/api/internal/application-messages/reconcile`,
+    { method: "POST" },
+  );
+  if (
+    unauthorizedReconciliation.status !== 404 ||
+    !unauthorizedReconciliation.headers
+      .get("cache-control")
+      ?.includes("no-store")
+  ) {
+    throw new Error("Reconciliation entry point did not fail closed.");
+  }
+
+  const verify = await fetch(`${baseUrl}/api/applications/verify`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ credential: "malformed" }),
+  });
+  const verifyBody = await verify.text();
+  if (
+    verify.status !== 200 ||
+    !verifyBody.includes("verification request has been processed") ||
+    !verify.headers.get("cache-control")?.includes("no-store")
+  ) {
+    throw new Error(
+      "Verification API did not return its generic no-store outcome.",
+    );
+  }
+
+  const resend = await fetch(`${baseUrl}/api/applications/resend`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ email: "absent@example.invalid" }),
+  });
+  const resendBody = await resend.text();
+  if (
+    resend.status !== 200 ||
+    !resendBody.includes("request is eligible") ||
+    !resend.headers.get("cache-control")?.includes("no-store")
+  ) {
+    throw new Error("Resend API did not return its generic no-store outcome.");
+  }
+
+  const malformedSubmission = await fetch(`${baseUrl}/api/applications`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: "{}",
+  });
+  if (
+    malformedSubmission.status !== 422 ||
+    !malformedSubmission.headers.get("cache-control")?.includes("no-store")
+  ) {
+    throw new Error(
+      "Submission API did not reject malformed input before lookup.",
+    );
+  }
+
   process.stdout.write(
-    `Route verification passed: ${routeClasses.size} route classes, ${resolvedRoutes.length} routes, GET/HEAD, fallback, and shared security oracles.\n`,
+    `Route verification passed: ${routeClasses.size} route classes, ${resolvedRoutes.length} routes, GET/HEAD, POST-only application APIs, generic outcomes, fallback, and shared security oracles.\n`,
   );
 } finally {
   server.kill("SIGTERM");
   await new Promise((resolve) => {
     if (server.exitCode !== null) resolve();
     else server.once("exit", resolve);
+  });
+  await rm(path.join(projectRoot, ".next", "cache"), {
+    recursive: true,
+    force: true,
   });
 }

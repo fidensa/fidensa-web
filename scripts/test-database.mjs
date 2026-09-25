@@ -282,20 +282,25 @@ async function submit(
   {
     label,
     email = `${label}@synthetic.invalid`,
+    deliveryEmail = email,
     now = "2039-01-01T00:00:00Z",
     environment = "Test",
     marketing = false,
+    operationDigest = digest(`${label}:operation`),
+    verificationDigest = digest(`${label}:verification`),
+    ipDigest = digest(`${label}:ip`),
+    emailDigest = digest(`${label}:email`),
   },
 ) {
   await configureTestAuthority(db, now, environment);
   const parameters = [
     true,
     email,
-    email,
-    digest(`${label}:operation`),
-    digest(`${label}:verification`),
-    digest(`${label}:ip`),
-    digest(`${label}:email`),
+    deliveryEmail,
+    operationDigest,
+    verificationDigest,
+    ipDigest,
+    emailDigest,
     "Synthetic Applicant",
     "Synthetic Role",
     "Work",
@@ -329,6 +334,36 @@ async function verify(db, label, now = "2039-01-01T00:01:00Z") {
       digest(`${label}:verification`),
       digest(`${label}:verify-ip`),
     ]),
+  );
+}
+
+async function resend(
+  db,
+  { email, credentialLabel, now, ipDigest, emailDigest },
+) {
+  await configureTestAuthority(db, now);
+  return withRole(db, "service_role", () =>
+    scalar(
+      db,
+      "select fidensa_api.resend_application_verification($1,$2,$3,$4)",
+      [email, digest(credentialLabel), ipDigest, emailDigest],
+    ),
+  );
+}
+
+async function seedAbuseEvent(
+  db,
+  { eventClass, ipDigest, emailDigest = null, now },
+) {
+  await configureTestAuthority(db, now);
+  await db.query(
+    `insert into fidensa_private.abuse_events (
+       event_class,ip_digest,email_digest,rate_class,result_class,
+       occurred_at,deletion_deadline
+     ) values ($1,$2,$3,'fixed_clock_boundary_fixture','allowed',
+       fidensa_private.authoritative_now(),
+       fidensa_private.authoritative_now()+interval '48 hours')`,
+    [eventClass, ipDigest, emailDigest],
   );
 }
 
@@ -533,8 +568,8 @@ async function testCatalogAndAccess(db) {
         `select count(*) from pg_proc p join pg_namespace n on n.oid=p.pronamespace
          where n.nspname='fidensa_api' and has_function_privilege('service_role',p.oid,'execute')`,
       ),
-    ) === 6,
-    "server secret role must receive only the six server operations",
+    ) === 13,
+    "server secret role must receive only the thirteen server operations",
   );
   for (const operation of ["run_current_retention", "run_retention_health"]) {
     await withRole(db, "service_role", () =>
@@ -571,6 +606,1142 @@ async function testCatalogAndAccess(db) {
     "browser and server roles must have no private relation read grant",
   );
   console.log("PASS catalog, grants, RLS, and public denial");
+}
+
+async function testApplicationDeliveryIntents(db) {
+  await db.exec("begin");
+  const now = "2039-01-02T00:00:00Z";
+  await configureTestAuthority(db, now);
+  const label = "delivery-intent";
+  const email = `${label}@synthetic.invalid`;
+  const parameters = [
+    true,
+    email,
+    email,
+    digest(`${label}:operation`),
+    digest(`${label}:verification`),
+    digest(`${label}:ip`),
+    digest(`${label}:email`),
+    "Synthetic Applicant",
+    "Synthetic Role",
+    "Work",
+    "Synthetic Organization",
+    "[synthetic fixture]",
+    "[synthetic fixture]",
+    "Not sure yet",
+    "No fixed timeline",
+    "Maybe",
+    null,
+    null,
+    null,
+    "privacy-v1",
+    true,
+    "updates-v1",
+  ];
+  const placeholders = parameters.map((_, index) => `$${index + 1}`).join(",");
+  const submissionIntent = await withRole(db, "service_role", () =>
+    scalar(
+      db,
+      `select fidensa_api.submit_application_intake(${placeholders})`,
+      parameters,
+    ),
+  );
+  invariant(
+    submissionIntent?.applicationId &&
+      submissionIntent?.deliveryEmail === email &&
+      submissionIntent?.operationId,
+    "submission wrapper must return one minimal delivery intent",
+  );
+  invariant(
+    (await scalar(
+      db,
+      `select state||':'||attempt_count::text
+         from fidensa_private.application_message_outbox
+        where communication_id=(select id from fidensa_private.communications where operation_id=$1)`,
+      [submissionIntent.operationId],
+    )) === "claimed:1" &&
+      (await withRole(db, "service_role", () =>
+        scalar(db, "select fidensa_api.claim_application_message($1)", [
+          submissionIntent.operationId,
+        ]),
+      )) === null,
+    "verification intent must be atomically leased to its credential-bearing worker",
+  );
+  await withRole(db, "service_role", () =>
+    db.query(
+      "select fidensa_api.record_application_message_outcome($1,'accepted_by_provider',$2,$3)",
+      [
+        submissionIntent.operationId,
+        digest("synthetic-verification-provider-message"),
+        "synthetic-verification-provider-message",
+      ],
+    ),
+  );
+  invariant(
+    Number(
+      await scalar(
+        db,
+        `select count(*) from information_schema.columns
+          where table_schema='fidensa_private'
+            and table_name='application_message_outbox'
+            and column_name like '%credential%'`,
+      ),
+    ) === 0,
+    "outbox schema must have no reversible credential column",
+  );
+  invariant(
+    (await scalar(
+      db,
+      "select state from fidensa_private.application_message_outbox where communication_id=(select id from fidensa_private.communications where operation_id=$1)",
+      [submissionIntent.operationId],
+    )) === "accepted",
+    "initial verification acceptance must close its outbox intent",
+  );
+  invariant(
+    await scalar(
+      db,
+      `select pa.acknowledged and pa.notice_version='privacy-v1'
+              and pa.acknowledged_at='2039-01-02T00:00:00Z'::timestamptz
+              and s.state='pending_confirmation'
+              and s.consent_text_version='updates-v1'
+              and s.consented_at='2039-01-02T00:00:00Z'::timestamptz
+         from fidensa_private.privacy_acknowledgements pa
+         join fidensa_private.subscriptions s on s.application_id=pa.application_id
+        where pa.application_id=$1`,
+      [submissionIntent.applicationId],
+    ),
+    "submission must separately capture authoritative acknowledgment and selected-consent versions/timestamps",
+  );
+
+  await configureTestAuthority(db, "2039-01-02T00:02:00Z");
+  const verificationIntent = await withRole(db, "service_role", () =>
+    scalar(db, "select fidensa_api.verify_application_intake($1,$2)", [
+      digest(`${label}:verification`),
+      digest(`${label}:verify-ip`),
+    ]),
+  );
+  invariant(
+    verificationIntent?.applicationId === submissionIntent.applicationId &&
+      verificationIntent?.deliveryEmail === email &&
+      verificationIntent?.receiptOperationId &&
+      verificationIntent?.reviewerOperationId,
+    "verification wrapper must return the two committed outbox identities",
+  );
+  invariant(
+    (await scalar(
+      db,
+      "select state::text from fidensa_private.subscriptions where application_id=$1",
+      [submissionIntent.applicationId],
+    )) === "active",
+    "first verification must activate only the existing pending consent",
+  );
+  const receiptClaim = await withRole(db, "service_role", () =>
+    scalar(db, "select fidensa_api.claim_application_message($1)", [
+      verificationIntent.receiptOperationId,
+    ]),
+  );
+  invariant(
+    receiptClaim?.attemptCount === 1 &&
+      receiptClaim?.providerMessageId === null,
+    "receipt must begin as a first bounded delivery attempt",
+  );
+  await withRole(db, "service_role", () =>
+    db.query(
+      "select fidensa_api.record_application_message_outcome($1,'delivery_unknown',null,null)",
+      [verificationIntent.receiptOperationId],
+    ),
+  );
+  await configureTestAuthority(db, "2039-01-02T00:03:01Z");
+  const retryClaim = await withRole(db, "service_role", () =>
+    scalar(db, "select fidensa_api.claim_application_message($1)", [
+      verificationIntent.receiptOperationId,
+    ]),
+  );
+  invariant(
+    retryClaim?.attemptCount === 2 && retryClaim?.reconciliation === true,
+    "unknown receipt must retry with the stable operation only inside the bounded window",
+  );
+  await withRole(db, "service_role", () =>
+    db.query(
+      "select fidensa_api.record_application_message_outcome($1,'accepted_by_provider',$2,$3)",
+      [
+        verificationIntent.receiptOperationId,
+        digest("synthetic-receipt-provider-message"),
+        "synthetic-receipt-provider-message",
+      ],
+    ),
+  );
+  const reviewerClaim = await withRole(db, "service_role", () =>
+    scalar(db, "select fidensa_api.claim_application_message($1)", [
+      verificationIntent.reviewerOperationId,
+    ]),
+  );
+  invariant(
+    reviewerClaim?.attemptCount === 1,
+    "reviewer notice must be claimable",
+  );
+  await withRole(db, "service_role", () =>
+    db.query(
+      "select fidensa_api.record_application_message_outcome($1,'delivery_unknown',$2,$3)",
+      [
+        verificationIntent.reviewerOperationId,
+        digest("synthetic-reviewer-provider-message"),
+        "synthetic-reviewer-provider-message",
+      ],
+    ),
+  );
+  await configureTestAuthority(db, "2039-01-02T00:04:02Z");
+  const lookupClaim = await withRole(db, "service_role", () =>
+    scalar(db, "select fidensa_api.claim_application_message($1)", [
+      verificationIntent.reviewerOperationId,
+    ]),
+  );
+  invariant(
+    lookupClaim?.providerMessageId === "synthetic-reviewer-provider-message" &&
+      lookupClaim?.attemptCount === 1,
+    "provider identity must reconcile by lookup without consuming a send attempt",
+  );
+  await withRole(db, "service_role", () =>
+    db.query(
+      "select fidensa_api.record_application_message_outcome($1,'accepted_by_provider',$2,$3)",
+      [
+        verificationIntent.reviewerOperationId,
+        digest("synthetic-reviewer-provider-message"),
+        "synthetic-reviewer-provider-message",
+      ],
+    ),
+  );
+  const replay = await withRole(db, "service_role", () =>
+    scalar(db, "select fidensa_api.verify_application_intake($1,$2)", [
+      digest(`${label}:verification`),
+      digest(`${label}:verify-ip-replay`),
+    ]),
+  );
+  invariant(
+    replay === null,
+    "verification wrapper replay must return no intent",
+  );
+  invariant(
+    Number(
+      await scalar(
+        db,
+        "select count(*) from fidensa_private.communications where application_id=$1 and class='automatic'",
+        [submissionIntent.applicationId],
+      ),
+    ) === 3 &&
+      (await scalar(
+        db,
+        "select string_agg(type::text,',' order by type::text) from fidensa_private.communications where application_id=$1 and class='automatic'",
+        [submissionIntent.applicationId],
+      )) === "receipt,reviewer_notification,verification",
+    "first verification and replay must leave exactly the three approved automatic communications",
+  );
+  const uncheckedId = await submit(db, {
+    label: "delivery-unchecked",
+    now: "2039-01-02T00:02:00Z",
+    marketing: false,
+  });
+  invariant(
+    Number(
+      await scalar(
+        db,
+        "select count(*) from fidensa_private.subscriptions where application_id=$1",
+        [uncheckedId],
+      ),
+    ) === 0,
+    "unchecked marketing consent must create no subscription",
+  );
+  const unknownVerificationOperation = await scalar(
+    db,
+    "select operation_id from fidensa_private.communications where application_id=$1 and type='verification'",
+    [uncheckedId],
+  );
+  await db.query(
+    `insert into fidensa_private.application_message_outbox (
+       communication_id,state,attempt_count,first_attempt_at,available_at,
+       lease_expires_at,created_at,updated_at
+     ) select id,'claimed',1,fidensa_private.authoritative_now(),
+              fidensa_private.authoritative_now(),
+              fidensa_private.authoritative_now()+interval '5 minutes',
+              fidensa_private.authoritative_now(),fidensa_private.authoritative_now()
+         from fidensa_private.communications where operation_id=$1`,
+    [unknownVerificationOperation],
+  );
+  await withRole(db, "service_role", () =>
+    db.query(
+      "select fidensa_api.record_application_message_outcome($1,'delivery_unknown',null,null)",
+      [unknownVerificationOperation],
+    ),
+  );
+  invariant(
+    (await scalar(
+      db,
+      `select state||':'||owner_reason
+         from fidensa_private.application_message_outbox
+        where communication_id=(select id from fidensa_private.communications where operation_id=$1)`,
+      [unknownVerificationOperation],
+    )) === "needs_reconciliation:credential_unavailable",
+    "an ambiguous verification send without provider identity must never retry an unrecoverable credential",
+  );
+
+  async function seedOutbox(type, operationTime) {
+    await configureTestAuthority(db, operationTime);
+    const operationId = await scalar(
+      db,
+      `with communication as (
+         insert into fidensa_private.communications (
+           application_id,type,class,actor,recipient_class,template_version,
+           operation_id,outcome,occurred_at
+         ) values (
+           $1,$2,'automatic','system',
+           case when $2='reviewer_notification' then 'reviewer' else 'applicant' end,
+           'synthetic-outbox-probe-v1',gen_random_uuid(),'intended',
+           fidensa_private.authoritative_now()
+         ) returning id,operation_id
+       ), inserted as (
+         insert into fidensa_private.application_message_outbox (
+           communication_id,available_at,created_at,updated_at
+         ) select id,fidensa_private.authoritative_now(),
+                  fidensa_private.authoritative_now(),fidensa_private.authoritative_now()
+             from communication
+       ) select operation_id from communication`,
+      [submissionIntent.applicationId, type],
+    );
+    return operationId;
+  }
+
+  const missedOperation = await seedOutbox("receipt", "2039-01-02T01:00:00Z");
+  await configureTestAuthority(db, "2039-01-02T03:00:00Z");
+  const missedClaim = await withRole(db, "service_role", () =>
+    scalar(db, "select fidensa_api.claim_application_message($1)", [
+      missedOperation,
+    ]),
+  );
+  invariant(
+    missedClaim?.attemptCount === 1,
+    "a missed hourly run must leave pending work claimable by the next run",
+  );
+  await configureTestAuthority(db, "2039-01-02T03:05:01Z");
+  const recoveredLease = await withRole(db, "service_role", () =>
+    scalar(db, "select fidensa_api.claim_application_message($1)", [
+      missedOperation,
+    ]),
+  );
+  invariant(
+    recoveredLease?.attemptCount === 2,
+    "an abandoned five-minute lease must recover as a bounded retry",
+  );
+  await withRole(db, "service_role", () =>
+    db.query(
+      "select fidensa_api.record_application_message_outcome($1,'accepted_by_provider',null,null)",
+      [missedOperation],
+    ),
+  );
+
+  const windowOperation = await seedOutbox("receipt", "2039-01-03T00:00:00Z");
+  await withRole(db, "service_role", async () => {
+    await db.query("select fidensa_api.claim_application_message($1)", [
+      windowOperation,
+    ]);
+    await db.query(
+      "select fidensa_api.record_application_message_outcome($1,'delivery_unknown',null,null)",
+      [windowOperation],
+    );
+  });
+  await configureTestAuthority(db, "2039-01-03T11:59:59Z");
+  const beforeWindow = await withRole(db, "service_role", () =>
+    scalar(db, "select fidensa_api.claim_application_message($1)", [
+      windowOperation,
+    ]),
+  );
+  invariant(
+    beforeWindow?.attemptCount === 2,
+    "an identical-key retry must remain eligible just before 12 hours",
+  );
+  await withRole(db, "service_role", () =>
+    db.query(
+      "select fidensa_api.record_application_message_outcome($1,'delivery_unknown',null,null)",
+      [windowOperation],
+    ),
+  );
+  await configureTestAuthority(db, "2039-01-03T12:00:00Z");
+  invariant(
+    (await withRole(db, "service_role", () =>
+      scalar(db, "select fidensa_api.claim_application_message($1)", [
+        windowOperation,
+      ]),
+    )) === null &&
+      (await scalar(
+        db,
+        `select state||':'||owner_reason
+           from fidensa_private.application_message_outbox
+          where communication_id=(select id from fidensa_private.communications where operation_id=$1)`,
+        [windowOperation],
+      )) === "needs_reconciliation:provider_window_expired",
+    "the 12-hour boundary must stop automatic resend and surface owner reconciliation",
+  );
+
+  const cappedOperation = await seedOutbox(
+    "reviewer_notification",
+    "2039-01-04T00:00:00Z",
+  );
+  for (let attempt = 1; attempt <= 3; attempt += 1) {
+    await configureTestAuthority(db, `2039-01-04T00:0${(attempt - 1) * 2}:01Z`);
+    const claim = await withRole(db, "service_role", () =>
+      scalar(db, "select fidensa_api.claim_application_message($1)", [
+        cappedOperation,
+      ]),
+    );
+    invariant(
+      claim?.attemptCount === attempt,
+      `outbox attempt ${attempt} must be bounded and observable`,
+    );
+    await withRole(db, "service_role", () =>
+      db.query(
+        "select fidensa_api.record_application_message_outcome($1,'delivery_unknown',null,null)",
+        [cappedOperation],
+      ),
+    );
+  }
+  invariant(
+    (await scalar(
+      db,
+      `select state||':'||owner_reason
+         from fidensa_private.application_message_outbox
+        where communication_id=(select id from fidensa_private.communications where operation_id=$1)`,
+      [cappedOperation],
+    )) === "needs_reconciliation:attempt_cap_reached",
+    "the third unknown send must stop and expose the attempt-cap escalation",
+  );
+
+  const beforeHoneypot = Number(
+    await scalar(
+      db,
+      "select count(*) from fidensa_private.abuse_events where rate_class='application_submission' and result_class='denied'",
+    ),
+  );
+  await withRole(db, "service_role", () =>
+    db.query("select fidensa_api.record_application_honeypot($1,$2)", [
+      digest("honeypot:ip"),
+      digest("honeypot:email"),
+    ]),
+  );
+  invariant(
+    Number(
+      await scalar(
+        db,
+        "select count(*) from fidensa_private.abuse_events where rate_class='application_submission' and result_class='denied'",
+      ),
+    ) ===
+      beforeHoneypot + 1,
+    "honeypot wrapper must retain one bounded abuse event",
+  );
+  await db.exec("rollback");
+  console.log(
+    "PASS minimal delivery intents, single verification emission, replay, and honeypot event",
+  );
+}
+
+async function testApplicationRateLimits(db) {
+  await db.exec("begin");
+
+  const sharedEmail = "rate-email@synthetic.invalid";
+  const sharedEmailDigest = digest("rate-email:digest");
+  for (let index = 0; index < 3; index += 1) {
+    await submit(db, {
+      label: `rate-email-hour-${index}`,
+      email: sharedEmail,
+      now: "2039-02-01T00:00:00Z",
+      operationDigest: digest(`rate-email-hour:operation:${index}`),
+      emailDigest: sharedEmailDigest,
+    });
+  }
+  await submit(db, {
+    label: "rate-email-hour-denied",
+    email: sharedEmail,
+    now: "2039-02-01T00:00:00Z",
+    operationDigest: digest("rate-email-hour:operation:denied"),
+    emailDigest: sharedEmailDigest,
+  });
+  invariant(
+    Number(
+      await scalar(
+        db,
+        "select count(*) from fidensa_private.abuse_events where event_class='submission' and email_digest=$1 and result_class='denied'",
+        [sharedEmailDigest],
+      ),
+    ) === 1,
+    "submission must enforce the 3/hour normalized-email cap",
+  );
+
+  const dailyEmail = "rate-email-day@synthetic.invalid";
+  const dailyEmailDigest = digest("rate-email-day:digest");
+  for (let index = 0; index < 6; index += 1) {
+    const hour = String(index * 2).padStart(2, "0");
+    await submit(db, {
+      label: `rate-email-day-${index}`,
+      email: dailyEmail,
+      now: `2039-02-02T${hour}:00:00Z`,
+      operationDigest: digest(`rate-email-day:operation:${index}`),
+      emailDigest: dailyEmailDigest,
+    });
+  }
+  invariant(
+    Number(
+      await scalar(
+        db,
+        "select count(*) from fidensa_private.abuse_events where event_class='submission' and email_digest=$1 and result_class='allowed'",
+        [dailyEmailDigest],
+      ),
+    ) === 5 &&
+      Number(
+        await scalar(
+          db,
+          "select count(*) from fidensa_private.abuse_events where event_class='submission' and email_digest=$1 and result_class='denied'",
+          [dailyEmailDigest],
+        ),
+      ) === 1,
+    "submission must enforce the rolling 5/day normalized-email cap",
+  );
+
+  const hourlyIp = digest("rate-ip-hour:digest");
+  for (let index = 0; index < 11; index += 1) {
+    await submit(db, {
+      label: `rate-ip-hour-${index}`,
+      now: "2039-02-03T00:00:00Z",
+      ipDigest: hourlyIp,
+    });
+  }
+  invariant(
+    Number(
+      await scalar(
+        db,
+        "select count(*) from fidensa_private.applications where canonical_email like 'rate-ip-hour-%'",
+      ),
+    ) === 10,
+    "submission must enforce the 10/hour IP cap",
+  );
+
+  const cooldownDeniedEmail = "cooldown-denied@synthetic.invalid";
+  const cooldownDeniedDigest = digest("cooldown-denied:email");
+  await submit(db, {
+    label: "cooldown-denied",
+    email: cooldownDeniedEmail,
+    now: "2039-02-04T00:00:00Z",
+    emailDigest: cooldownDeniedDigest,
+  });
+  invariant(
+    !(await resend(db, {
+      email: cooldownDeniedEmail,
+      credentialLabel: "cooldown-denied:at-59",
+      now: "2039-02-04T00:00:59Z",
+      ipDigest: digest("cooldown-denied:ip"),
+      emailDigest: cooldownDeniedDigest,
+    })),
+    "resend must deny before the shared 60-second boundary",
+  );
+  const cooldownAllowedEmail = "cooldown-allowed@synthetic.invalid";
+  const cooldownAllowedDigest = digest("cooldown-allowed:email");
+  await submit(db, {
+    label: "cooldown-allowed",
+    email: cooldownAllowedEmail,
+    now: "2039-02-04T01:00:00Z",
+    emailDigest: cooldownAllowedDigest,
+  });
+  invariant(
+    await resend(db, {
+      email: cooldownAllowedEmail,
+      credentialLabel: "cooldown-allowed:at-60",
+      now: "2039-02-04T01:01:00Z",
+      ipDigest: digest("cooldown-allowed:ip"),
+      emailDigest: cooldownAllowedDigest,
+    }),
+    "resend must allow exactly at the shared 60-second boundary",
+  );
+
+  const resendEmail = "resend-hour@synthetic.invalid";
+  const resendEmailDigest = digest("resend-hour:email");
+  await submit(db, {
+    label: "resend-hour",
+    email: resendEmail,
+    now: "2039-02-04T02:00:00Z",
+    emailDigest: resendEmailDigest,
+  });
+  for (let index = 1; index <= 2; index += 1) {
+    invariant(
+      await resend(db, {
+        email: resendEmail,
+        credentialLabel: `resend-hour:${index}`,
+        now: `2039-02-04T02:0${index}:00Z`,
+        ipDigest: digest(`resend-hour:ip:${index}`),
+        emailDigest: resendEmailDigest,
+      }),
+      `resend ${index} inside the 3/hour combined budget must be allowed`,
+    );
+  }
+  invariant(
+    !(await resend(db, {
+      email: resendEmail,
+      credentialLabel: "resend-hour:denied",
+      now: "2039-02-04T02:03:00Z",
+      ipDigest: digest("resend-hour:ip:denied"),
+      emailDigest: resendEmailDigest,
+    })),
+    "resend must enforce the combined 3/hour email cap",
+  );
+
+  const resendDailyEmail = "resend-day@synthetic.invalid";
+  const resendDailyDigest = digest("resend-day:email");
+  await submit(db, {
+    label: "resend-day",
+    email: resendDailyEmail,
+    now: "2039-02-05T00:00:00Z",
+    emailDigest: resendDailyDigest,
+  });
+  for (let index = 1; index <= 4; index += 1) {
+    invariant(
+      await resend(db, {
+        email: resendDailyEmail,
+        credentialLabel: `resend-day:${index}`,
+        now: `2039-02-05T${String(index * 2).padStart(2, "0")}:00:00Z`,
+        ipDigest: digest(`resend-day:ip:${index}`),
+        emailDigest: resendDailyDigest,
+      }),
+      `resend ${index} inside the 5/day combined budget must be allowed`,
+    );
+  }
+  invariant(
+    !(await resend(db, {
+      email: resendDailyEmail,
+      credentialLabel: "resend-day:denied",
+      now: "2039-02-05T10:00:00Z",
+      ipDigest: digest("resend-day:ip:denied"),
+      emailDigest: resendDailyDigest,
+    })),
+    "resend must enforce the combined 5/day email cap",
+  );
+
+  const verificationIp = digest("verification-rate:ip");
+  await configureTestAuthority(db, "2039-02-06T00:00:00Z");
+  for (let index = 0; index < 31; index += 1) {
+    await withRole(db, "service_role", () =>
+      scalar(db, "select fidensa_api.verify_application($1,$2)", [
+        digest(`verification-rate:unknown:${index}`),
+        verificationIp,
+      ]),
+    );
+  }
+  invariant(
+    Number(
+      await scalar(
+        db,
+        "select count(*) from fidensa_private.abuse_events where event_class='verification' and ip_digest=$1 and result_class='denied'",
+        [verificationIp],
+      ),
+    ) === 1 &&
+      Number(
+        await scalar(
+          db,
+          "select count(*) from fidensa_private.abuse_events where event_class='verification' and ip_digest=$1 and result_class='allowed'",
+          [verificationIp],
+        ),
+      ) === 30,
+    "verification must allow N-1 and N, then enforce the 30/hour IP cap",
+  );
+
+  const submissionDailyIp = digest("submission-daily-boundary:ip");
+  const submissionDailyStart = Date.parse("2039-02-07T00:00:00Z");
+  for (let index = 0; index < 40; index += 1) {
+    await seedAbuseEvent(db, {
+      eventClass: "submission",
+      ipDigest: submissionDailyIp,
+      now: new Date(submissionDailyStart + index * 30 * 60_000).toISOString(),
+    });
+  }
+  invariant(
+    (await submit(db, {
+      label: "submission-ip-day-denied",
+      now: new Date(submissionDailyStart + 20 * 60 * 60_000).toISOString(),
+      ipDigest: submissionDailyIp,
+    })) === null,
+    "submission must behaviorally enforce the 40/day IP cap",
+  );
+  const submissionDailyNMinusOneIp = digest("submission-daily-n-minus-one:ip");
+  for (let index = 0; index < 39; index += 1) {
+    await seedAbuseEvent(db, {
+      eventClass: "submission",
+      ipDigest: submissionDailyNMinusOneIp,
+      now: new Date(submissionDailyStart + index * 30 * 60_000).toISOString(),
+    });
+  }
+  invariant(
+    await submit(db, {
+      label: "submission-ip-day-n-minus-one",
+      now: new Date(submissionDailyStart + 20 * 60 * 60_000).toISOString(),
+      ipDigest: submissionDailyNMinusOneIp,
+    }),
+    "submission must allow the daily IP boundary after N-1 prior events",
+  );
+
+  const verificationHourlyEmail = digest("verification-email-hour:email");
+  await submit(db, {
+    label: "verification-email-hour",
+    now: "2039-02-08T00:00:00Z",
+    emailDigest: verificationHourlyEmail,
+  });
+  for (let index = 0; index < 10; index += 1) {
+    await seedAbuseEvent(db, {
+      eventClass: "verification",
+      ipDigest: digest(`verification-email-hour:seed-ip:${index}`),
+      emailDigest: verificationHourlyEmail,
+      now: "2039-02-08T00:01:00Z",
+    });
+  }
+  await configureTestAuthority(db, "2039-02-08T00:02:00Z");
+  invariant(
+    !(await withRole(db, "service_role", () =>
+      scalar(db, "select fidensa_api.verify_application($1,$2)", [
+        digest("verification-email-hour:verification"),
+        digest("verification-email-hour:attempt-ip"),
+      ]),
+    )),
+    "verification must behaviorally enforce the 10/hour email cap",
+  );
+
+  const verificationDailyEmail = digest("verification-email-day:email");
+  await submit(db, {
+    label: "verification-email-day",
+    now: "2039-02-09T00:00:00Z",
+    emailDigest: verificationDailyEmail,
+  });
+  const verificationDailyStart = Date.parse("2039-02-09T01:00:00Z");
+  for (let index = 0; index < 20; index += 1) {
+    await seedAbuseEvent(db, {
+      eventClass: "verification",
+      ipDigest: digest(`verification-email-day:seed-ip:${index}`),
+      emailDigest: verificationDailyEmail,
+      now: new Date(verificationDailyStart + index * 60 * 60_000).toISOString(),
+    });
+  }
+  await configureTestAuthority(db, "2039-02-09T21:00:00Z");
+  invariant(
+    !(await withRole(db, "service_role", () =>
+      scalar(db, "select fidensa_api.verify_application($1,$2)", [
+        digest("verification-email-day:verification"),
+        digest("verification-email-day:attempt-ip"),
+      ]),
+    )),
+    "verification must behaviorally enforce the 20/day email cap",
+  );
+
+  const verificationDailyIp = digest("verification-ip-day:ip");
+  const verificationDailyIpStart = Date.parse("2039-02-09T22:00:00Z");
+  for (let index = 0; index < 99; index += 1) {
+    await seedAbuseEvent(db, {
+      eventClass: "verification",
+      ipDigest: verificationDailyIp,
+      now: new Date(
+        verificationDailyIpStart + index * 14 * 60_000,
+      ).toISOString(),
+    });
+  }
+  await configureTestAuthority(db, "2039-02-10T21:30:00Z");
+  invariant(
+    !(await withRole(db, "service_role", () =>
+      scalar(db, "select fidensa_api.verify_application($1,$2)", [
+        digest("verification-ip-day:n-minus-one"),
+        verificationDailyIp,
+      ]),
+    )),
+    "an unmatched verification remains a generic no-op at the daily IP N-1 boundary",
+  );
+  await withRole(db, "service_role", () =>
+    scalar(db, "select fidensa_api.verify_application($1,$2)", [
+      digest("verification-ip-day:denied"),
+      verificationDailyIp,
+    ]),
+  );
+  invariant(
+    Number(
+      await scalar(
+        db,
+        "select count(*) from fidensa_private.abuse_events where event_class='verification' and ip_digest=$1 and result_class='allowed'",
+        [verificationDailyIp],
+      ),
+    ) === 100 &&
+      Number(
+        await scalar(
+          db,
+          "select count(*) from fidensa_private.abuse_events where event_class='verification' and ip_digest=$1 and result_class='denied'",
+          [verificationDailyIp],
+        ),
+      ) === 1,
+    "verification must allow N-1 and N, then enforce the 100/day IP cap",
+  );
+
+  const resendHourlyIp = digest("resend-ip-hour:ip");
+  const resendHourlyEmail = "resend-ip-hour@synthetic.invalid";
+  const resendHourlyEmailDigest = digest("resend-ip-hour:email");
+  await submit(db, {
+    label: "resend-ip-hour",
+    email: resendHourlyEmail,
+    now: "2039-02-10T00:00:00Z",
+    emailDigest: resendHourlyEmailDigest,
+  });
+  for (let index = 0; index < 10; index += 1) {
+    await seedAbuseEvent(db, {
+      eventClass: "delivery",
+      ipDigest: resendHourlyIp,
+      emailDigest: digest(`resend-ip-hour:seed-email:${index}`),
+      now: "2039-02-10T00:01:00Z",
+    });
+  }
+  invariant(
+    !(await resend(db, {
+      email: resendHourlyEmail,
+      credentialLabel: "resend-ip-hour:replacement",
+      now: "2039-02-10T00:02:00Z",
+      ipDigest: resendHourlyIp,
+      emailDigest: resendHourlyEmailDigest,
+    })),
+    "resend must behaviorally enforce the 10/hour IP cap",
+  );
+  const resendHourlyNMinusOneIp = digest("resend-ip-hour-n-minus-one:ip");
+  for (let index = 0; index < 8; index += 1) {
+    await seedAbuseEvent(db, {
+      eventClass: "delivery",
+      ipDigest: resendHourlyNMinusOneIp,
+      emailDigest: digest(`resend-ip-hour-n-minus-one:email:${index}`),
+      now: "2039-02-10T01:01:00Z",
+    });
+  }
+  const resendHourlyNMinusOneEmail =
+    "resend-ip-hour-n-minus-one@synthetic.invalid";
+  const resendHourlyNMinusOneEmailDigest = digest(
+    "resend-ip-hour-n-minus-one:email",
+  );
+  await submit(db, {
+    label: "resend-ip-hour-n-minus-one",
+    email: resendHourlyNMinusOneEmail,
+    now: "2039-02-10T01:00:00Z",
+    emailDigest: resendHourlyNMinusOneEmailDigest,
+  });
+  invariant(
+    await resend(db, {
+      email: resendHourlyNMinusOneEmail,
+      credentialLabel: "resend-ip-hour-n-minus-one:replacement",
+      now: "2039-02-10T01:02:00Z",
+      ipDigest: resendHourlyNMinusOneIp,
+      emailDigest: resendHourlyNMinusOneEmailDigest,
+    }),
+    "resend must allow the hourly IP boundary after N-1 prior events",
+  );
+
+  const resendDailyIp = digest("resend-ip-day:ip");
+  const resendDailyIpEmail = "resend-ip-day@synthetic.invalid";
+  const resendDailyIpEmailDigest = digest("resend-ip-day:email");
+  await submit(db, {
+    label: "resend-ip-day",
+    email: resendDailyIpEmail,
+    now: "2039-02-11T00:00:00Z",
+    emailDigest: resendDailyIpEmailDigest,
+  });
+  const resendDailyIpStart = Date.parse("2039-02-11T01:00:00Z");
+  for (let index = 0; index < 30; index += 1) {
+    await seedAbuseEvent(db, {
+      eventClass: "delivery",
+      ipDigest: resendDailyIp,
+      emailDigest: digest(`resend-ip-day:seed-email:${index}`),
+      now: new Date(resendDailyIpStart + index * 40 * 60_000).toISOString(),
+    });
+  }
+  invariant(
+    !(await resend(db, {
+      email: resendDailyIpEmail,
+      credentialLabel: "resend-ip-day:replacement",
+      now: "2039-02-11T21:00:00Z",
+      ipDigest: resendDailyIp,
+      emailDigest: resendDailyIpEmailDigest,
+    })),
+    "resend must behaviorally enforce the 30/day IP cap",
+  );
+  const resendDailyNMinusOneIp = digest("resend-ip-day-n-minus-one:ip");
+  for (let index = 0; index < 28; index += 1) {
+    await seedAbuseEvent(db, {
+      eventClass: "delivery",
+      ipDigest: resendDailyNMinusOneIp,
+      emailDigest: digest(`resend-ip-day-n-minus-one:email:${index}`),
+      now: new Date(resendDailyIpStart + index * 40 * 60_000).toISOString(),
+    });
+  }
+  const resendDailyNMinusOneEmail =
+    "resend-ip-day-n-minus-one@synthetic.invalid";
+  const resendDailyNMinusOneEmailDigest = digest(
+    "resend-ip-day-n-minus-one:email",
+  );
+  await submit(db, {
+    label: "resend-ip-day-n-minus-one",
+    email: resendDailyNMinusOneEmail,
+    now: "2039-02-11T00:00:00Z",
+    emailDigest: resendDailyNMinusOneEmailDigest,
+  });
+  invariant(
+    await resend(db, {
+      email: resendDailyNMinusOneEmail,
+      credentialLabel: "resend-ip-day-n-minus-one:replacement",
+      now: "2039-02-11T21:00:00Z",
+      ipDigest: resendDailyNMinusOneIp,
+      emailDigest: resendDailyNMinusOneEmailDigest,
+    }),
+    "resend must allow the daily IP boundary after N-1 prior events",
+  );
+
+  const hourlyLeftBoundaryIp = digest("submission-hour-left-boundary:ip");
+  for (let index = 0; index < 10; index += 1) {
+    await seedAbuseEvent(db, {
+      eventClass: "submission",
+      ipDigest: hourlyLeftBoundaryIp,
+      now: "2039-02-12T00:00:00Z",
+    });
+  }
+  invariant(
+    await submit(db, {
+      label: "submission-hour-left-boundary",
+      now: "2039-02-12T01:00:00Z",
+      ipDigest: hourlyLeftBoundaryIp,
+    }),
+    "an event exactly at the rolling hourly left boundary must be excluded",
+  );
+
+  const dailyLeftBoundaryIp = digest("submission-day-left-boundary:ip");
+  const dailyLeftStart = Date.parse("2039-02-13T00:00:00Z");
+  for (let index = 0; index < 40; index += 1) {
+    await seedAbuseEvent(db, {
+      eventClass: "submission",
+      ipDigest: dailyLeftBoundaryIp,
+      now: new Date(dailyLeftStart + index * 35 * 60_000).toISOString(),
+    });
+  }
+  invariant(
+    await submit(db, {
+      label: "submission-day-left-boundary",
+      now: "2039-02-14T00:00:00Z",
+      ipDigest: dailyLeftBoundaryIp,
+    }),
+    "an event exactly at the rolling daily left boundary must be excluded",
+  );
+
+  const operationSource = await scalar(
+    db,
+    `select pg_get_functiondef('fidensa_api.verify_application(text,text)'::regprocedure)`,
+  );
+  invariant(
+    operationSource.includes(">= 100") &&
+      operationSource.includes(">= 10") &&
+      operationSource.includes(">= 20"),
+    "verification operation must retain the approved IP daily and email hourly/daily caps",
+  );
+  const submissionSource = await scalar(
+    db,
+    `select pg_get_functiondef('fidensa_api.submit_application(boolean,text,text,text,text,text,text,text,text,text,text,text,text,text,text,text,text,text,text,text,boolean,text)'::regprocedure)`,
+  );
+  invariant(
+    submissionSource.includes(">= 10") &&
+      submissionSource.includes(">= 40") &&
+      submissionSource.includes(">= 3") &&
+      submissionSource.includes(">= 5"),
+    "submission operation must retain the approved IP and email hourly/daily caps",
+  );
+  const resendSource = await scalar(
+    db,
+    `select pg_get_functiondef('fidensa_api.resend_application_verification(text,text,text,text)'::regprocedure)`,
+  );
+  invariant(
+    resendSource.includes(">= 10") &&
+      resendSource.includes(">= 30") &&
+      resendSource.includes(">= 3") &&
+      resendSource.includes(">= 5") &&
+      resendSource.includes("interval '60 seconds'"),
+    "resend operation must retain the approved IP/email hourly/daily caps and cooldown",
+  );
+
+  await db.exec("rollback");
+  console.log(
+    "PASS fixed-clock submission, verification, and resend cooldown/hour/day rate limits",
+  );
+}
+
+async function testApplicationFailurePaths(db) {
+  await db.exec("begin");
+
+  const duplicateEmail = "duplicate@synthetic.invalid";
+  const firstDuplicate = await submit(db, {
+    label: "duplicate-first",
+    email: duplicateEmail,
+    now: "2039-01-10T00:00:00Z",
+  });
+  const secondDuplicate = await submit(db, {
+    label: "duplicate-second",
+    email: duplicateEmail,
+    deliveryEmail: "Duplicate@Synthetic.Invalid",
+    now: "2039-01-10T00:00:01Z",
+  });
+  invariant(
+    firstDuplicate && secondDuplicate === null,
+    "case-only different-key duplicate submissions must retain one application",
+  );
+
+  const beforeExpiryId = await submit(db, {
+    label: "before-expiry-boundary",
+    now: "2039-01-10T00:00:00Z",
+  });
+  invariant(
+    beforeExpiryId &&
+      (await verify(db, "before-expiry-boundary", "2039-01-10T00:59:59Z")),
+    "credential must remain valid one second before the 60-minute boundary",
+  );
+
+  const expiredId = await submit(db, {
+    label: "expired-boundary",
+    now: "2039-01-10T01:00:00Z",
+  });
+  invariant(expiredId, "expiry fixture must commit");
+  invariant(
+    !(await verify(db, "expired-boundary", "2039-01-10T02:00:00Z")),
+    "credential must be invalid at the exact 60-minute boundary",
+  );
+
+  await configureTestAuthority(db, "2039-01-10T02:10:00Z");
+  const wrongPurposeDigest = digest("wrong-purpose:privacy-confirmation");
+  const privacyRequestId = await withRole(db, "service_role", () =>
+    scalar(
+      db,
+      "select fidensa_api.create_privacy_request('access',$1,$1,'privacy_public',$2,null)",
+      ["wrong-purpose@synthetic.invalid", digest("wrong-purpose:operation")],
+    ),
+  );
+  await db.query(
+    `insert into fidensa_private.privacy_credentials (
+       privacy_request_id,purpose,credential_digest,generation,issued_at,expires_at
+     ) values ($1,'privacy_confirmation',$2,1,
+       fidensa_private.authoritative_now(),
+       fidensa_private.authoritative_now()+interval '30 minutes')`,
+    [privacyRequestId, wrongPurposeDigest],
+  );
+  invariant(
+    !(await withRole(db, "service_role", () =>
+      scalar(db, "select fidensa_api.verify_application($1,$2)", [
+        wrongPurposeDigest,
+        digest("wrong-purpose:ip"),
+      ]),
+    )) &&
+      (await scalar(
+        db,
+        "select state::text from fidensa_private.privacy_credentials where privacy_request_id=$1",
+        [privacyRequestId],
+      )) === "issued",
+    "a database credential issued for another purpose must not verify an application",
+  );
+
+  const supersededEmail = "superseded@synthetic.invalid";
+  const supersededEmailDigest = digest("superseded:email");
+  const supersededId = await submit(db, {
+    label: "superseded",
+    email: supersededEmail,
+    now: "2039-01-10T03:00:00Z",
+    emailDigest: supersededEmailDigest,
+  });
+  invariant(
+    await resend(db, {
+      email: supersededEmail,
+      credentialLabel: "superseded:new",
+      now: "2039-01-10T03:01:00Z",
+      ipDigest: digest("superseded:resend-ip"),
+      emailDigest: supersededEmailDigest,
+    }),
+    "resend must issue a replacement credential",
+  );
+  await configureTestAuthority(db, "2039-01-10T03:02:00Z");
+  invariant(
+    !(await withRole(db, "service_role", () =>
+      scalar(db, "select fidensa_api.verify_application($1,$2)", [
+        digest("superseded:verification"),
+        digest("superseded:old-ip"),
+      ]),
+    )) &&
+      (await withRole(db, "service_role", () =>
+        scalar(db, "select fidensa_api.verify_application($1,$2)", [
+          digest("superseded:new"),
+          digest("superseded:new-ip"),
+        ]),
+      )),
+    "supersession must reject the old credential and consume only the new one",
+  );
+  invariant(
+    Number(
+      await scalar(
+        db,
+        "select count(*) from fidensa_private.reviewer_status where application_id=$1",
+        [supersededId],
+      ),
+    ) === 1,
+    "supersession must create exactly one queue entry",
+  );
+
+  const concurrentId = await submit(db, {
+    label: "concurrent-verify",
+    now: "2039-01-10T04:00:00Z",
+  });
+  await configureTestAuthority(db, "2039-01-10T04:01:00Z");
+  await db.exec("set role service_role");
+  let concurrentResults;
+  try {
+    concurrentResults = await Promise.all([
+      scalar(db, "select fidensa_api.verify_application($1,$2)", [
+        digest("concurrent-verify:verification"),
+        digest("concurrent-verify:ip-one"),
+      ]),
+      scalar(db, "select fidensa_api.verify_application($1,$2)", [
+        digest("concurrent-verify:verification"),
+        digest("concurrent-verify:ip-two"),
+      ]),
+    ]);
+  } finally {
+    await db.exec("reset role");
+  }
+  invariant(
+    concurrentResults.filter(Boolean).length === 1 &&
+      Number(
+        await scalar(
+          db,
+          "select count(*) from fidensa_private.reviewer_status where application_id=$1",
+          [concurrentId],
+        ),
+      ) === 1,
+    "serialized concurrent first use must promote exactly once",
+  );
+
+  await db.exec("savepoint rollback_probe");
+  const rollbackId = await submit(db, {
+    label: "rollback-probe",
+    now: "2039-01-10T05:00:00Z",
+  });
+  invariant(rollbackId, "rollback fixture must initially commit");
+  await db.exec("rollback to savepoint rollback_probe");
+  invariant(
+    Number(
+      await scalar(
+        db,
+        "select count(*) from fidensa_private.applications where canonical_email='rollback-probe@synthetic.invalid'",
+      ),
+    ) === 0,
+    "database rollback must remove the application and its message outbox",
+  );
+
+  await db.exec("rollback");
+  console.log(
+    "PASS duplicate, expiry, supersession, concurrent first-use, and rollback paths",
+  );
 }
 
 async function testApplicationQueueAndScoring(db) {
@@ -2857,6 +4028,9 @@ async function main() {
       `PASS fresh migration apply (${initialTableCount} private domain tables)`,
     );
     await testCatalogAndAccess(db);
+    await testApplicationDeliveryIntents(db);
+    await testApplicationFailurePaths(db);
+    await testApplicationRateLimits(db);
     await testApplicationQueueAndScoring(db);
     await testStudioOwnerBypassDenial(db);
     await testRetention(db);

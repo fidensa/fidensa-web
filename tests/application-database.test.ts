@@ -46,7 +46,11 @@ describe("application database boundary", () => {
     const fetchImplementation: typeof fetch = vi.fn(async (input, init) => {
       requests.push({ url: String(input), init });
       return new Response(
-        JSON.stringify("00000000-0000-4000-8000-000000000301"),
+        JSON.stringify({
+          applicationId: "00000000-0000-4000-8000-000000000301",
+          deliveryEmail: "adapter@synthetic.invalid",
+          operationId: "00000000-0000-4000-8000-000000000302",
+        }),
         {
           status: 200,
           headers: { "Content-Type": "application/json" },
@@ -62,12 +66,13 @@ describe("application database boundary", () => {
       fetchImplementation,
     });
 
-    await expect(database.submit(submission())).resolves.toBe(
-      "00000000-0000-4000-8000-000000000301",
-    );
+    await expect(database.submit(submission())).resolves.toMatchObject({
+      applicationId: "00000000-0000-4000-8000-000000000301",
+      operationId: "00000000-0000-4000-8000-000000000302",
+    });
     expect(requests).toHaveLength(1);
     expect(requests[0].url).toBe(
-      "https://project.invalid/rest/v1/rpc/submit_application",
+      "https://project.invalid/rest/v1/rpc/submit_application_intake",
     );
     expect(requests[0].init?.cache).toBe("no-store");
     expect(requests[0].init?.headers).toMatchObject({
@@ -114,5 +119,47 @@ describe("application database boundary", () => {
     await expect(database.verify("raw-value", digest("ip"))).rejects.toThrow(
       "digest",
     );
+  });
+
+  it("rejects malformed privileged-operation results", async () => {
+    const database = createSupabaseApplicationDatabase({
+      baseUrl: "https://project.invalid",
+      serviceCredential: "x".repeat(40),
+      fetchImplementation: vi.fn(
+        async () =>
+          new Response(JSON.stringify({ deliveryEmail: "redirect@invalid" }), {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+          }),
+      ),
+    });
+    await expect(database.submit(submission())).rejects.toThrow(
+      "malformed delivery intent",
+    );
+  });
+
+  it("lets resend delivery use only the address stored by the database", async () => {
+    const requests: RequestInit[] = [];
+    const database = createSupabaseApplicationDatabase({
+      baseUrl: "https://project.invalid",
+      serviceCredential: "x".repeat(40),
+      fetchImplementation: vi.fn(async (_input, init) => {
+        requests.push(init ?? {});
+        return Response.json({
+          applicationId: "00000000-0000-4000-8000-000000000321",
+          deliveryEmail: "Stored.Address@Example.invalid",
+          operationId: "00000000-0000-4000-8000-000000000322",
+        });
+      }),
+    });
+    const result = await database.resendVerification(
+      "stored.address@example.invalid",
+      digest("replacement"),
+      digest("ip"),
+      digest("email"),
+    );
+    expect(result?.deliveryEmail).toBe("Stored.Address@Example.invalid");
+    expect(String(requests[0].body)).not.toContain("p_delivery_email");
+    expect(String(requests[0].body)).not.toContain("sealed");
   });
 });

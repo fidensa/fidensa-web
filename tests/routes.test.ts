@@ -9,6 +9,7 @@ describe("baseline route source", () => {
   it.each([
     ["/", "src/app/page.tsx"],
     ["/apply", "src/app/apply/page.tsx"],
+    ["/apply/verify", "src/app/apply/verify/page.tsx"],
     ["/privacy", "src/app/privacy/page.tsx"],
     ["/evidence", "src/app/evidence/page.tsx"],
   ])("maps %s to a governed route module", async (_route, file) => {
@@ -62,5 +63,22 @@ describe("baseline route source", () => {
         }),
       ]),
     );
+  });
+
+  it("defines the server-only reconciliation entry point at minute 10 UTC", async () => {
+    const source = await readFile(
+      path.join(
+        root,
+        "src/app/api/internal/application-messages/reconcile/route.ts",
+      ),
+      "utf8",
+    );
+    const runtime = await readFile(
+      path.join(root, "src/server/application-runtime.ts"),
+      "utf8",
+    );
+    expect(source).toContain("reconciliationAccess");
+    expect(source).toContain("timingSafeEqual");
+    expect(runtime).toContain('APPLICATION_RECONCILIATION_CRON = "10 * * * *"');
   });
 });

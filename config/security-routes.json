@@ -16,6 +16,13 @@
       "representation": "html-nonce"
     },
     {
+      "path": "/apply/verify",
+      "class": "public-html",
+      "status": 200,
+      "methods": ["GET", "HEAD"],
+      "representation": "html-nonce"
+    },
+    {
       "path": "/privacy",
       "class": "public-html",
       "status": 200,
